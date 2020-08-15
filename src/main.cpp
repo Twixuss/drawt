@@ -460,16 +460,16 @@ void initLocalization() {
 	localizations[Language_english].unsavedScene              = L"This scene has unsaved changes. Discard?";
 	localizations[Language_english].unsavedScenes             = L"There are unsaved scenes. Exit?";
 
-	localizations[Language_russian].windowTitle_path_gridSize = L"Drawt - %s - Сцена %u - Размер сетки: %u";
-	localizations[Language_russian].windowTitle_path          = L"Drawt - %s - Сцена %u";
-	localizations[Language_russian].windowTitle_gridSize      = L"Drawt - <untitled> - Сцена %u - Размер сетки: %u";
-	localizations[Language_russian].windowTitle               = L"Drawt - <untitled> - Сцена %u";
-	localizations[Language_russian].warning                   = L"Внимание!";
-	localizations[Language_russian].fileFilter                = L"Drawt сцена\0*.drawt\0";
-	localizations[Language_russian].saveFileTitle             = L"Сохранить Drawt сцену";
-	localizations[Language_russian].openFileTitle             = L"Открыть Drawt сцену";
-	localizations[Language_russian].unsavedScene              = L"Эта сцена не сохранена. Продолжить?";
-	localizations[Language_russian].unsavedScenes             = L"Не все сцены сохранены. Выйти?";
+	localizations[Language_russian].windowTitle_path_gridSize = L"Drawt - %s - РЎС†РµРЅР° %u - Р Р°Р·РјРµСЂ СЃРµС‚РєРё: %u";
+	localizations[Language_russian].windowTitle_path          = L"Drawt - %s - РЎС†РµРЅР° %u";
+	localizations[Language_russian].windowTitle_gridSize      = L"Drawt - <untitled> - РЎС†РµРЅР° %u - Р Р°Р·РјРµСЂ СЃРµС‚РєРё: %u";
+	localizations[Language_russian].windowTitle               = L"Drawt - <untitled> - РЎС†РµРЅР° %u";
+	localizations[Language_russian].warning                   = L"Р’РЅРёРјР°РЅРёРµ!";
+	localizations[Language_russian].fileFilter                = L"Drawt СЃС†РµРЅР°\0*.drawt\0";
+	localizations[Language_russian].saveFileTitle             = L"РЎРѕС…СЂР°РЅРёС‚СЊ Drawt СЃС†РµРЅСѓ";
+	localizations[Language_russian].openFileTitle             = L"РћС‚РєСЂС‹С‚СЊ Drawt СЃС†РµРЅСѓ";
+	localizations[Language_russian].unsavedScene              = L"Р­С‚Р° СЃС†РµРЅР° РЅРµ СЃРѕС…СЂР°РЅРµРЅР°. РџСЂРѕРґРѕР»Р¶РёС‚СЊ?";
+	localizations[Language_russian].unsavedScenes             = L"РќРµ РІСЃРµ СЃС†РµРЅС‹ СЃРѕС…СЂР°РЅРµРЅС‹. Р’С‹Р№С‚Рё?";
 }
 void initGlobals(HINSTANCE instance) {
 	TIMED_FUNCTION;
