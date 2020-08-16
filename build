@@ -1,0 +1,7 @@
+#!/bin/bash
+if [ ! -d "bin" ]; then
+	mkdir bin
+fi
+pushd bin
+g++ ../src/main.cpp -std=c++17 -fpermissive -fmax-errors=1 -msse
+popd

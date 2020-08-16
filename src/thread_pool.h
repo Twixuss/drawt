@@ -1,6 +1,7 @@
 #include <queue>
 #include <mutex>
 #include <optional>
+#include <functional>
 
 template <class Predicate>
 void waitUntil(Predicate &&predicate) {
@@ -85,7 +86,7 @@ struct ThreadWork {
 
 struct ThreadPool {
 	Allocator allocator = osAllocator;
-	HANDLE *threads = 0;
+	void **threads = 0;
 	u32 threadCount = 0;
 	u32 volatile initializedThreadCount = 0;
 	u32 volatile deadThreadCount = 0;
@@ -202,7 +203,7 @@ bool initThreadPool(ThreadPool *pool, u32 threadCount, ThreadProc &&threadProc =
 	pool->doingWork = false;
 	pool->threadCount = threadCount;
 	if (threadCount) {
-		pool->threads = allocate<HANDLE>(pool->allocator, threadCount);
+		pool->threads = allocate<void *>(pool->allocator, threadCount);
 		
 		struct StartParams {
 			ThreadPool *pool;
@@ -212,20 +213,30 @@ bool initThreadPool(ThreadPool *pool, u32 threadCount, ThreadProc &&threadProc =
 		params.pool = pool;
 		params.proc = std::addressof(threadProc);
 		
-		auto startProc = [](void *param) -> DWORD {
+		auto startProc = [](void *param) {
 			StartParams *info = (StartParams *)param;
 			(*info->proc)(info->pool);
 			return 0;
 		};
 
 		for (u32 i = 0; i < threadCount; ++i) {
+#if OS_WINDOWS
 			pool->threads[i] = CreateThread(0, 0, startProc, &params, 0, 0);
 			if (!pool->threads[i]) {
+				for (u32 j = 0; j < i; ++j) {err
+					CloseHandle(pool->threads[j]);
+				}
+				return false;
+			}
+#else
+			int err = pthread_create(&pool->threads[i], 0, startProc, &params);
+			if (err) {
 				for (u32 j = 0; j < i; ++j) {
 					CloseHandle(pool->threads[j]);
 				}
 				return false;
 			}
+#endif
 		}
 
 		waitUntil([&] {

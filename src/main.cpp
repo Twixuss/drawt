@@ -1,27 +1,35 @@
 ﻿#include <variant>
 #include <optional>
 #include <codecvt>
+#include <locale>
 #include <string>
+#include <chrono>
 
-#include <fcntl.h>
 #include <stdio.h>
+
+#if OS_WINDOWS
+#include <fcntl.h>
 #include <io.h>
 
 #define NOMINMAX
 #include <Windows.h>
 #include <Windowsx.h>
-#include <d3d11.h>
-#include <d3d11_3.h>
-#include <d3dcompiler.h>
+#endif
 
 std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>,wchar_t> utf16ToUtf8Converter;
-HWND consoleWindow;
 FILE *logFile;
+
+void hideConsoleWindow();
+void showConsoleWindow();
+void toggleConsoleWindow();
+
+#if OS_WINDOWS
+HWND consoleWindow;
 
 #define LOG(fmt, ...)											\
 	do {														\
 		char buf[1024];											\
-		sprintf_s(buf, _countof(buf), fmt "\n", __VA_ARGS__);	\
+		sprintf_s(buf, countof(buf), fmt "\n", __VA_ARGS__);	\
 		OutputDebugStringA(buf);								\
 		fprintf(logFile, buf);									\
 		printf("%s", buf);										\
@@ -30,16 +38,33 @@ FILE *logFile;
 #define LOGW(fmt, ...)													\
 	do {																\
 		wchar buf[1024];												\
-		swprintf_s(buf, _countof(buf), fmt L"\n", __VA_ARGS__);			\
+		swprintf_s(buf, countof(buf), fmt L"\n", __VA_ARGS__);			\
 		OutputDebugStringW(buf);										\
 		fprintf(logFile, utf16ToUtf8Converter.to_bytes(buf).data());	\
 		wprintf(L"%s", buf);											\
 	} while(0)
+#else
+#define LOG(fmt, ...)											\
+	do {														\
+		char buf[1024];											\
+		sprintf_s(buf, countof(buf), fmt "\n", __VA_ARGS__);	\
+		fprintf(logFile, buf);									\
+		printf("%s", buf);										\
+	} while(0)
+
+#define LOGW(fmt, ...)													\
+	do {																\
+		wchar buf[1024];												\
+		swprintf_s(buf, countof(buf), fmt L"\n", __VA_ARGS__);			\
+		fprintf(logFile, utf16ToUtf8Converter.to_bytes(buf).data());	\
+		wprintf(L"%s", buf);											\
+	} while(0)
+#endif
 
 #define ASSERTION_FAILURE(causeString, expression, ...)	\
 	do {												\
 		LOG("%s: %s", causeString, expression);			\
-		ShowWindow(consoleWindow, SW_SHOW);				\
+		showConsoleWindow();				            \
 		DEBUG_BREAK;									\
 		exit(-1);										\
 	} while(0)
@@ -58,6 +83,7 @@ FILE *logFile;
 
 using namespace TL;
 
+#if OS_WINDOWS
 #define DHR(hr) 											\
 	do {													\
 		HRESULT _hr = hr;									\
@@ -71,17 +97,15 @@ using namespace TL;
 			exit(-1);										\
 		}													\
 	} while (0)
+#endif
 
-LARGE_INTEGER performanceFrequncy;
 
 #define TIMED_BLOCK_(name, line)								\
 	char const *CONCAT(__timer_name_, line) = name;				\
-	LARGE_INTEGER CONCAT(__timer_begin_, line);					\
-	QueryPerformanceCounter(&CONCAT(__timer_begin_, line));		\
+	auto CONCAT(__timer_begin_, line) = std::chrono::high_resolution_clock::now();					\
 	DEFER {														\
-		LARGE_INTEGER CONCAT(__timer_end_, line);				\
-		QueryPerformanceCounter(&CONCAT(__timer_end_, line));	\
-		LOG("%s: %.1f ms", CONCAT(__timer_name_, line), (f64)(CONCAT(__timer_end_, line).QuadPart - CONCAT(__timer_begin_, line).QuadPart) / performanceFrequncy.QuadPart * 1000);	\
+		auto CONCAT(__timer_end_, line) = std::chrono::high_resolution_clock::now();				\
+		LOG("%s: %.1f ms", CONCAT(__timer_name_, line), (f64)(CONCAT(__timer_end_, line) - CONCAT(__timer_begin_, line)).count() / 1000000);	\
 	}
 
 #define TIMED_BLOCK(name) TIMED_BLOCK_(name, __LINE__)
@@ -90,7 +114,7 @@ LARGE_INTEGER performanceFrequncy;
 #define memequ(a, b, s) (memcmp(a, b, s) == 0)
 
 #include "thread_pool.h"
-
+#if OS_WINDOWS
 struct Shader {
 	ID3D11VertexShader *vs = 0;
 	ID3D11PixelShader *ps = 0;
@@ -124,7 +148,10 @@ struct alignas(16) ColorConstantBufferData {
 struct alignas(16) ActionConstantBufferData {
 	v3f color;
 };
-
+using GfxBuffer = D3D11::StructuredBuffer;
+#else
+using GfxBuffer = GLint;
+#endif
 struct TransformedPoint {
 	m2 transform;
 	v2f position;
@@ -159,7 +186,7 @@ struct PencilAction {
 	bool popNextTime;
 
 	List<TransformedLine> transformedLines;
-	D3D11::StructuredBuffer lineBuffer;
+	GfxBuffer lineBuffer;
 };
 
 struct LineAction {
@@ -169,7 +196,7 @@ struct LineAction {
 	v2f initialPosition;
 	f32 initialThickness;
 
-	D3D11::StructuredBuffer buffer;
+	GfxBuffer buffer;
 };
 
 struct GridAction {
@@ -178,7 +205,7 @@ struct GridAction {
 	v2f endPosition;
 	u32 cellCount;
 
-	D3D11::StructuredBuffer buffer;
+	GfxBuffer buffer;
 };
 
 enum ActionType {
@@ -436,7 +463,7 @@ void toggleConsoleWindow() {
 }
 void initLocalization() {
 	wchar localeBuf[LOCALE_NAME_MAX_LENGTH];
-	if (GetUserDefaultLocaleName(localeBuf, _countof(localeBuf))) {
+	if (GetUserDefaultLocaleName(localeBuf, countof(localeBuf))) {
 		LOGW(L"Locale: %s", localeBuf);
 		wchar *dash = wcsstr(localeBuf, L"-");
 		if (dash) {
@@ -690,50 +717,50 @@ ID3D11PixelShader *createPixelShader(char const *src, umm srcSize, char const *n
 	bc->Release();
 	return result;
 }
-
+#if OS_WINDOWS
 #define SCENE_CBUFFER_SOURCE \
-R"(
-cbuffer _ : register(b0) {
-	float2 scenePosition;
-	float2 sceneScale;
-	float3 drawColor;
-	float drawThickness;
-	float2 mouseWorldPos;
-}
-float2 sceneToNDC(float2 p) { return (p - scenePosition) * sceneScale; }
-float2 sceneToNDC(float2 p, float2 offset) { return (p - scenePosition + offset) * sceneScale; }
+R"(\
+cbuffer _ : register(b0) {\
+	float2 scenePosition;\
+	float2 sceneScale;\
+	float3 drawColor;\
+	float drawThickness;\
+	float2 mouseWorldPos;\
+}\
+float2 sceneToNDC(float2 p) { return (p - scenePosition) * sceneScale; }\
+float2 sceneToNDC(float2 p, float2 offset) { return (p - scenePosition + offset) * sceneScale; }\
 )"
 #define GLOBAL_CBUFFER_SOURCE \
-R"(
-cbuffer _ : register(b1) {
-	float4x4 matrixWindowToNDC;
-	float2 windowSize;
-	float windowAspect;
-};
+R"(\
+cbuffer _ : register(b1) {\
+	float4x4 matrixWindowToNDC;\
+	float2 windowSize;\
+	float windowAspect;\
+};\
 )"
 #define PIE_CBUFFER_SOURCE \
-R"(
-cbuffer _ : register(b2) {
-	float2 piePos;
-	float pieAngle;
-	float pieSize;
-	float pieAlpha;
-}
+R"(\
+cbuffer _ : register(b2) {\
+	float2 piePos;\
+	float pieAngle;\
+	float pieSize;\
+	float pieAlpha;\
+}\
 )"
 #define COLOR_CBUFFER_SOURCE \
-R"(
-cbuffer _ : register(b3) {
-	float2 colorMenuPos;
-	float colorMenuSize;
-	float colorMenuAlpha;
-	float3 colorMenuHueColor;
-}
+R"(\
+cbuffer _ : register(b3) {\
+	float2 colorMenuPos;\
+	float colorMenuSize;\
+	float colorMenuAlpha;\
+	float3 colorMenuHueColor;\
+}\
 )"
 #define ACTION_CBUFFER_SOURCE \
-R"(
-cbuffer _ : register(b4) {
-	float3 actionColor;
-}
+R"(\
+cbuffer _ : register(b4) {\
+	float3 actionColor;\
+}\
 )"
 
 void initLineShader() {
@@ -1052,7 +1079,6 @@ float4 main(in float3 uv : UV) : SV_Target {
 	u32 const pixelShaderSourceSize = sizeof(pixelShaderSourceData);
 	colorMenuShader.ps = createPixelShader(pixelShaderSourceData, pixelShaderSourceSize, "colorMenu_ps");
 }
-
 void setViewport(f32 x, f32 y, f32 w, f32 h) {
 	D3D11_VIEWPORT v{};
 	v.TopLeftX = x;
@@ -1062,6 +1088,7 @@ void setViewport(f32 x, f32 y, f32 w, f32 h) {
 	v.MaxDepth = 1.0f;
 	d3d11State.immediateContext->RSSetViewports(1, &v);
 }
+#endif
 
 bool shouldRepaint(Scene const *scene) {
 	return scene->drawColorDirty || scene->constantBufferDirty || scene->matrixSceneToNDCDirty || scene->needRepaint;
@@ -1581,7 +1608,7 @@ bool tryExitApp() {
 }
 void exitAppAbnormal() {
 	bool hasUnsavedScenes = false;
-	for (u32 i = 0; i < _countof(scenes); ++i) {
+	for (u32 i = 0; i < countof(scenes); ++i) {
 		Scene *scene = scenes + i;
 		if (isUnsaved(scene)) {
 			hasUnsavedScenes = true;
@@ -1610,7 +1637,7 @@ void exitAppAbnormal() {
 		savePath += second; savePath.push_back(L'\\');
 		CreateDirectoryW(savePath.data(), 0);
 		u32 savePathSize = savePath.size();
-		for (u32 i = 0; i < _countof(scenes); ++i) {
+		for (u32 i = 0; i < countof(scenes); ++i) {
 			Scene *scene = scenes + i;
 			if (isUnsaved(scene)) {
 				savePath.resize(savePathSize);
@@ -1697,7 +1724,7 @@ void initD3D11() {
 		static constexpr u32 atlasData[] {
 #include "atlas.h"
 		};
-		static_assert(_countof(atlasData) == 128*128);
+		static_assert(countof(atlasData) == 128*128);
 		d3d11Queue.push([&] {
 			TIMED_BLOCK("toolAtlas");
 			toolAtlas = d3d11State.createTexture(128, 128, DXGI_FORMAT_R8G8B8A8_UNORM, atlasData);
@@ -2544,15 +2571,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int) {
 			wchar buf[1024];
 			if (currentScene->path.size()) {
 				if (displayGridSize) {
-					swprintf_s(buf, _countof(buf), localizations[language].windowTitle_path_gridSize, currentScene->filename, (u32)(currentScene - scenes), displayGridSize);
+					swprintf_s(buf, countof(buf), localizations[language].windowTitle_path_gridSize, currentScene->filename, (u32)(currentScene - scenes), displayGridSize);
 				} else {
-					swprintf_s(buf, _countof(buf), localizations[language].windowTitle_path, currentScene->filename, (u32)(currentScene - scenes));
+					swprintf_s(buf, countof(buf), localizations[language].windowTitle_path, currentScene->filename, (u32)(currentScene - scenes));
 				}
 			} else {
 				if (displayGridSize) {
-					swprintf_s(buf, _countof(buf), localizations[language].windowTitle_gridSize, (u32)(currentScene - scenes), displayGridSize);
+					swprintf_s(buf, countof(buf), localizations[language].windowTitle_gridSize, (u32)(currentScene - scenes), displayGridSize);
 				} else {
-					swprintf_s(buf, _countof(buf), localizations[language].windowTitle, (u32)(currentScene - scenes));
+					swprintf_s(buf, countof(buf), localizations[language].windowTitle, (u32)(currentScene - scenes));
 				}
 			}
 			SetWindowTextW(mainWindow, buf);
