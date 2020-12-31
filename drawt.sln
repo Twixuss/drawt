@@ -4,6 +4,31 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 VisualStudioVersion = 16.0.29926.136
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{911E67C6-3D85-4FCE-B560-20A9C3E3FF48}") = "drawt", "bin\drawt.exe", "{6D740EE6-24A1-46B1-8BEC-1D826F2C8476}"
+	ProjectSection(DebuggerProjectSystem) = preProject
+		PortSupplier = 00000000-0000-0000-0000-000000000000
+		Executable = F:\src\drawt\bin\drawt.exe
+		RemoteMachine = DESKTOP-2HA4U8E
+		StartingDirectory = F:\src\drawt\bin
+		Environment = По умолчанию
+		LaunchingEngine = 00000000-0000-0000-0000-000000000000
+		UseLegacyDebugEngines = No
+		LaunchSQLEngine = No
+		AttachLaunchAction = No
+	EndProjectSection
+EndProject
+Project("{911E67C6-3D85-4FCE-B560-20A9C3E3FF48}") = "image2cpp", "bin\image2cpp.exe", "{16DE6502-D96E-4A89-9624-EFBB71C52CAC}"
+	ProjectSection(DebuggerProjectSystem) = preProject
+		PortSupplier = 00000000-0000-0000-0000-000000000000
+		Executable = F:\src\drawt\bin\image2cpp.exe
+		RemoteMachine = DESKTOP-2HA4U8E
+		StartingDirectory = F:\src\drawt\bin
+		Arguments = ..\ui\atlas.png ..\src\atlas.h --flip-y --transparent-adjacent
+		Environment = По умолчанию
+		LaunchingEngine = 00000000-0000-0000-0000-000000000000
+		UseLegacyDebugEngines = No
+		LaunchSQLEngine = No
+		AttachLaunchAction = No
+	EndProjectSection
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -11,6 +36,7 @@ Global
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
 		{6D740EE6-24A1-46B1-8BEC-1D826F2C8476}.Release|x64.ActiveCfg = Release|x64
+		{16DE6502-D96E-4A89-9624-EFBB71C52CAC}.Release|x64.ActiveCfg = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

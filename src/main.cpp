@@ -1,625 +1,657 @@
-﻿#include <variant>
+﻿// TODO: finish detection hovering entity
+// TODO: entity reordering
+// TODO: entity moving, rotating, scaling
+
+#include "platform.h"
+#include <variant>
 #include <optional>
-#include <codecvt>
-#include <locale>
-#include <string>
 #include <chrono>
+#include <thread>
+#include <unordered_map>
+#include <algorithm>
+#include <random>
 
 #include <stdio.h>
 
-#if OS_WINDOWS
-#include <fcntl.h>
-#include <io.h>
+#include "../dep/stb/stb_image.h"
 
-#define NOMINMAX
-#include <Windows.h>
-#include <Windowsx.h>
-#endif
+#define CURRENT_VERSION ((u16)0)
 
-std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>,wchar_t> utf16ToUtf8Converter;
-FILE *logFile;
-
-void hideConsoleWindow();
-void showConsoleWindow();
-void toggleConsoleWindow();
-
-#if OS_WINDOWS
-HWND consoleWindow;
-
-#define LOG(fmt, ...)											\
-	do {														\
-		char buf[1024];											\
-		sprintf_s(buf, countof(buf), fmt "\n", __VA_ARGS__);	\
-		OutputDebugStringA(buf);								\
-		fprintf(logFile, buf);									\
-		printf("%s", buf);										\
-	} while(0)
-
-#define LOGW(fmt, ...)													\
-	do {																\
-		wchar buf[1024];												\
-		swprintf_s(buf, countof(buf), fmt L"\n", __VA_ARGS__);			\
-		OutputDebugStringW(buf);										\
-		fprintf(logFile, utf16ToUtf8Converter.to_bytes(buf).data());	\
-		wprintf(L"%s", buf);											\
-	} while(0)
-#else
-#define LOG(fmt, ...)											\
-	do {														\
-		char buf[1024];											\
-		sprintf_s(buf, countof(buf), fmt "\n", __VA_ARGS__);	\
-		fprintf(logFile, buf);									\
-		printf("%s", buf);										\
-	} while(0)
-
-#define LOGW(fmt, ...)													\
-	do {																\
-		wchar buf[1024];												\
-		swprintf_s(buf, countof(buf), fmt L"\n", __VA_ARGS__);			\
-		fprintf(logFile, utf16ToUtf8Converter.to_bytes(buf).data());	\
-		wprintf(L"%s", buf);											\
-	} while(0)
-#endif
-
-#define ASSERTION_FAILURE(causeString, expression, ...)	\
-	do {												\
-		LOG("%s: %s", causeString, expression);			\
-		showConsoleWindow();				            \
-		DEBUG_BREAK;									\
-		exit(-1);										\
-	} while(0)
-
-#define TL_IMPL
 #include "../dep/tl/include/tl/common.h"
 #include "../dep/tl/include/tl/list.h"
 #include "../dep/tl/include/tl/math.h"
-#include "../dep/tl/include/tl/d3d11.h"
 #include "../dep/tl/include/tl/thread.h"
-
-#pragma comment(lib, "shell32")
-#pragma comment(lib, "ole32")
-#pragma comment(lib, "comdlg32")
-#pragma comment(lib, "winmm")
-
-using namespace TL;
-
-#if OS_WINDOWS
-#define DHR(hr) 											\
-	do {													\
-		HRESULT _hr = hr;									\
-		if (FAILED(_hr)) {									\
-			char hrValueStr[16];							\
-			sprintf(hrValueStr, "0x%x", _hr);				\
-			LOG("BAD HRESULT: %s", #hr);					\
-			LOG("VALUE: %s", hrValueStr);					\
-			DEBUG_BREAK;									\
-			MessageBoxA(0, "BAD HRESULT", hrValueStr, 0);	\
-			exit(-1);										\
-		}													\
-	} while (0)
-#endif
-
-
-#define TIMED_BLOCK_(name, line)								\
-	char const *CONCAT(__timer_name_, line) = name;				\
-	auto CONCAT(__timer_begin_, line) = std::chrono::high_resolution_clock::now();					\
-	DEFER {														\
-		auto CONCAT(__timer_end_, line) = std::chrono::high_resolution_clock::now();				\
-		LOG("%s: %.1f ms", CONCAT(__timer_name_, line), (f64)(CONCAT(__timer_end_, line) - CONCAT(__timer_begin_, line)).count() / 1000000);	\
-	}
-
-#define TIMED_BLOCK(name) TIMED_BLOCK_(name, __LINE__)
-#define TIMED_FUNCTION TIMED_BLOCK(__FUNCTION__)
+#include "../dep/tl/include/tl/string.h"
+#include "../dep/tl/include/tl/console.h"
+#include "../dep/tl/include/tl/file.h"
+#include "../dep/tl/include/tl/debug.h"
+//#include "../dep/tl/include/tl/net.h"
 
 #define memequ(a, b, s) (memcmp(a, b, s) == 0)
+#define strequ(a, b) (strcmp(a, b) == 0)
+#define wcsequ(a, b) (wcscmp(a, b) == 0)
 
-#include "thread_pool.h"
-#if OS_WINDOWS
-struct Shader {
-	ID3D11VertexShader *vs = 0;
-	ID3D11PixelShader *ps = 0;
+#include "../dep/tl/include/tl/thread.h"
+
+#include "renderer.h"
+
+Entity *getEntityById(Scene *scene, EntityId id) {
+	auto it = scene->entities.find(id);
+	if (it == scene->entities.end())
+		return 0;
+	return &it->second;
+}
+
+enum ImageScalingAnchor {
+	ImageScaling_left,
+	ImageScaling_right,
+	ImageScaling_top,
+	ImageScaling_bottom,
+	ImageScaling_topLeft,
+	ImageScaling_topRight,
+	ImageScaling_bottomLeft,
+	ImageScaling_bottomRight,
 };
 
-struct alignas(16) SceneConstantBufferData {
-	v2f scenePosition;
-	v2f sceneScale;
-	v3f drawColor;
-	f32 drawThickness;
-	v2f mouseWorldPos;
-};
+#undef ACTIONS
+#undef ENTITIES
+#undef DECLARE_MEMBER
+#undef DECLARE_CONSTRUCTOR
+#undef CASE_DESTRUCTOR
+#undef CASE_NEW_MOVE
 
-struct alignas(16) GlobalConstantBufferData {
-	m4 matrixWindowToNDC;
-	v2f windowSize;
-	f32 windowAspect;
-};
-struct alignas(16) PieConstantBufferData {
-	v2f piePos;
-	f32 pieAngle;
-	f32 pieSize;
-	f32 pieAlpha;
-};
-struct alignas(16) ColorConstantBufferData {
-	v2f position;
-	f32 size;
-	f32 alpha;
-	v3f hueColor;
-};
-struct alignas(16) ActionConstantBufferData {
-	v3f color;
-};
-using GfxBuffer = D3D11::StructuredBuffer;
-#else
-using GfxBuffer = GLint;
-#endif
-struct TransformedPoint {
-	m2 transform;
-	v2f position;
-};
 
-struct TransformedLine {
-	TransformedPoint a, b;
-};
+//using NetMessage = u32;
+//enum : NetMessage {
+//	Net_startAction,
+//	Net_updateAction,
+//	Net_stopAction,
+//};
 
-struct Point {
-	f32 thickness;
-	v2f position;
-};
-
-struct Line {
-	Point a, b;
-};
-
-struct Quad {
-	v2f position;
-	v2f size;
-	v2f uvMin;
-	v2f uvMax;
-	v4f color;
-};
-
-struct PencilAction {
-	v3f color;
-	List<Line> lines;
-
-	Point newLineStartPoint;
-	bool popNextTime;
-
-	List<TransformedLine> transformedLines;
-	GfxBuffer lineBuffer;
-};
-
-struct LineAction {
-	v3f color;
-	Line line;
-
-	v2f initialPosition;
-	f32 initialThickness;
-
-	GfxBuffer buffer;
-};
-
-struct GridAction {
-	v3f color;
-	Point startPoint;
-	v2f endPosition;
-	u32 cellCount;
-
-	GfxBuffer buffer;
-};
-
-enum ActionType {
-	ActionType_none,
-	ActionType_pencil,
-	ActionType_line,
-	ActionType_grid,
-};
-
-#define ACTION_T(PencilAction, pencil, ActionType_pencil)\
-	Action(PencilAction const &that) : type(ActionType_pencil), pencil(that) {}\
-	Action(PencilAction &&that) : type(ActionType_pencil), pencil(std::move(that)) {}\
-	Action &operator=(PencilAction const &that) { this->~Action(); return *new (this) Action(that); }\
-	Action &operator=(PencilAction &&that) { this->~Action(); return *new (this) Action(std::move(that)); }
-
-struct Action {
-	ActionType type = {};
-	union {
-		PencilAction pencil;
-		LineAction line;
-		GridAction grid;
-	};
-	Action() {}
-	ACTION_T(PencilAction, pencil, ActionType_pencil);
-	ACTION_T(LineAction, line, ActionType_line);
-	ACTION_T(GridAction, grid, ActionType_grid);
-	Action(Action const &that) {
-		type = that.type;
-		switch (that.type) {
-			case ActionType_none  : break;
-			case ActionType_pencil: new (this) Action(that.pencil); break;
-			case ActionType_line  : new (this) Action(that.line); break;
-			case ActionType_grid  : new (this) Action(that.grid); break;
-		}
-	}
-	Action(Action &&that) {
-		switch (that.type) {
-			case ActionType_none  : break;
-			case ActionType_pencil: new (this) Action(std::move(that.pencil)); break;
-			case ActionType_line  : new (this) Action(std::move(that.line)); break;
-			case ActionType_grid  : new (this) Action(std::move(that.grid)); break;
-		}
-		that.reset();
-	}
-	Action &operator=(Action const &that) { reset(); new (this) Action(that); }
-	Action &operator=(Action &&that) { reset(); new (this) Action(std::move(that)); }
-	~Action() {
-		switch (type) {
-			case ActionType_pencil: pencil.~PencilAction(); break;
-			case ActionType_line: line.~LineAction(); break;
-			case ActionType_grid: grid.~GridAction(); break;
-		}
-		type = ActionType_none;
-	}
-	void reset() { this->~Action(); }
-};
-
-enum Tool {
-	Tool_pencil,
-	Tool_line,
-	Tool_grid,
-	Tool_dropper,
-	Tool_count,
-};
-
-struct Scene {
-	List<Action> actions;
-	u32 postLastVisibleActionIndex = 0;
-	Tool currentTool = Tool_pencil;
-	v2f cameraPosition = {};
-	f32 cameraDistance = 1.0f;
-	f32 drawThickness = 16.0f;
-	v3f drawColor = {1,1,1};
-
+struct LoadedImage {
 	std::wstring path;
-	wchar *filename = 0;
-	u64 savedHash;
-
-	D3D11::RenderTexture canvasRT, canvasRTMS;
-	bool needResize = true;
-	bool needRepaint = true;
-	SceneConstantBufferData constantBufferData;
-	ID3D11Buffer *constantBuffer;
-	bool matrixSceneToNDCDirty = true;
-	bool drawColorDirty = true;
-	bool constantBufferDirty = false;
-
-	bool initialized = false;
+	u32 refCount;
+	void *renderData;
+	bool operator==(LoadedImage const &that) const {
+		return path == that.path;
+	}
 };
 
-enum Language {
-	Language_english,
-	Language_russian,
-	Language_count
+namespace std {
+
+template <>
+struct hash<LoadedImage> {
+	size_t operator()(LoadedImage const &image) const {
+		return (size_t)image.renderData >> 3;
+	}
 };
 
-struct Localization {
-	wchar const *windowTitle_path_gridSize;
-	wchar const *windowTitle_path;
-	wchar const *windowTitle_gridSize;
-	wchar const *windowTitle;
-	wchar const *warning;
-	wchar const *fileFilter;
-	wchar const *saveFileTitle;
-	wchar const *openFileTitle;
-	wchar const *unsavedScene;
-	wchar const *unsavedScenes;
-};
+}
 
-struct PieMenuItem {
-	v2u uv;
-	void (*onSelect)();
-};
-struct PieMenu {
-	List<PieMenuItem> items;
-	f32 T = 0;
-	f32 prevT = 0;
-	bool TChanged = false;
-	v2f position = {};
-	bool opened = false;
-	f32 alpha = 0;
-	ID3D11Buffer *constantBuffer = 0;
-};
+static std::thread imageLoaderThread;
+static std::unordered_map<std::wstring, LoadedImage> allLoadedImages;
+static CircularQueue<LoadedImage *, 1024> imagesToLoad;
+static Mutex loadedImagesMutex;
 
-enum ColorMenuTarget {
-	ColorMenuTarget_draw,
-	ColorMenuTarget_canvas,
-};
-
-std::wstring executableDirectory;
-
-HWND mainWindow;
-bool running;
-bool needRepaint = true;
-bool windowResized;
-bool lostFocus;
-bool exitSizeMove;
-bool windowSizeDirty = true;
-bool updateWindowText = true;
-v2u windowSize;
-v2s windowPos;
-v2s mousePos, mousePosBL, prevMousePos;
-v2f mouseWorldPos;
-v2s mouseDelta;
-s32 mouseWheel;
-bool keysHeld[256];
-bool keysDown[256];
-bool keysDownRep[256];
-bool keysUp[256];
-bool mouseButtons[8];
-bool prevMouseButtons[8];
-bool resetKeys;
-bool consoleIsVisible = true;
-u32 ignoreCursorFrameCount;
-
-ThreadPool threadPool;
+ThreadPool<TL_DEFAULT_ALLOCATOR> threadPool;
 
 Language language;
 Localization localizations[Language_count];
 
-D3D11::State d3d11State;
-Shader lineShader, quadShader, blitShader, blitShaderMS, circleShader, pieSelShader, colorMenuShader;
-constexpr u32 vertexPerLineCount = 48;
-D3D11::StructuredBuffer uiSBuffer;
-constexpr u32 toolImageSize = 32;
-D3D11::Texture toolAtlas;
-ID3D11BlendState *alphaBlend;
-ID3D11Buffer *globalConstantBuffer;
-ID3D11Buffer *colorConstantBuffer;
-ID3D11Buffer *actionConstantBuffer;
-GlobalConstantBufferData globalConstantBufferData;
-ColorConstantBufferData colorConstantBufferData;
-ID3D11RasterizerState *currentRasterizer;
-ID3D11RasterizerState *defaultRasterizer;
-ID3D11RasterizerState *wireframeRasterizer;
-u32 msaaSampleCount;
-v4f canvasColor = {0.25f, 0.25f, 0.25f, 1.0f};
+Renderer *renderer;
 
-constexpr u32 pencilLineBufferDefElemCount = 1024;
+constexpr f32 minPencilLineLength = 4;
 
 Scene scenes[10];
 Scene *currentScene = scenes + 1;
 Scene *previousScene;
 u64 emptySceneHash;
-Action currentAction;
+Entity *currentEntity;
+Action *currentAction;
+//NetAction currentNetAction;
 v2f cameraVelocity;
-f32 targetCameraDistance = 1.0f;
 f32 oldCameraDistance = 1.0f;
 f32 targetThickness = 16.0f;
 f32 oldThickness = 16.0f;
-constexpr float minPencilLineLength = 0.5f;
 bool playingSceneShiftAnimation;
 f32 sceneShiftT;
-u32 displayGridSize;
-PieMenu mainPieMenu, toolPieMenu, canvasPieMenu;
-constexpr f32 pieMenuSize = 0.125f;
+v2u displayGridSize;
+PieMenu mainPieMenu;
+f32 pieMenuSize;
+constexpr f32 cameraMoveSpeed = 0.5f;
+
+Entity *draggingEntity = 0;
+v2f draggingEntityOffset;
+
+Entity *rotatingEntity = 0;
+f32 rotatingEntityInitialAngle;
+
+ImageEntity *scalingImage = 0;
+v2f draggingPointUv;
+ImageScalingAnchor scalingImageAnchor;
+
+Entity *hoveredEntity = 0;
+v2f hoveredImageUv;
+
+bool cameraPanning;
+f32 toolImageSize;
 
 bool colorMenuOpened;
-bool colorMenuSelecting;
-f32 colorMenuAlpha;
-v2f colorMenuPosition;
+bool colorMenuSelectingH;
+bool colorMenuSelectingSV;
+f32 prevColorMenuAnimTime;
+f32 colorMenuAnimTime;
+f32 colorMenuAnimValue;
+v2f colorMenuPositionTL;
 f32 colorMenuHue;
 ColorMenuTarget colorMenuTarget;
 
-bool loadScene(Scene *, wchar const *);
+List<DebugPoint> debugPoints;
 
-struct DropTargetImpl : IDropTarget {
-	ULONG STDMETHODCALLTYPE AddRef() override { return 0; }
-	ULONG STDMETHODCALLTYPE Release() override { return 0; }
-	STDMETHOD(QueryInterface(REFIID riid, void** ppvObject)) override { return E_ABORT; }
-	STDMETHOD(DragEnter(IDataObject* pDataObj, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect)) override { 
-		*pdwEffect = DROPEFFECT_COPY;
-		return S_OK; 
+bool thicknessChanged;
+bool mouseScenePosChanged;
+bool smoothMousePosChanged;
+bool cameraDistanceChanged;
+bool cursorVisible;
+
+bool previousMouseHovering = false;
+v2f smoothMousePos = {};
+v2f oldSmoothMousePos = {};
+f32 smoothMousePosT = 1.0f;
+f32 targetImageRotation = 0;
+Entity *previousHoveredEntity = 0;
+
+bool drawBounds;
+bool debugPencil;
+
+// net::Socket listener, connection;
+// MutexCircularQueue<Action, 1024> receivedActions;
+
+bool app_loadScene(Scene *, wchar const *);
+void generateGfxData(Scene *);
+u64 getSceneHash(Scene *scene);
+void app_exitAbnormal();
+void resizeRenderTargets();
+bool proceedCloseScene();
+
+void calculateBounds(EntityBase &e);
+
+bool manipulatingEntity() {
+	return draggingEntity || rotatingEntity || scalingImage;
+}
+bool smoothable(Tool tool) {
+	return tool == Tool_pencil;
+}
+
+void ungetImageData(Span<wchar> path) {
+	SCOPED_LOCK(loadedImagesMutex);
+	auto &img = allLoadedImages.at(std::wstring(path.data(), path.size()));
+	--img.refCount;
+	if (!img.refCount) {
+		renderer->releaseImageData(img.renderData);
 	}
-	STDMETHOD(DragOver(DWORD grfKeyState, POINTL pt, DWORD* pdwEffect)) override { return 0; }
-	STDMETHOD(DragLeave(void)) override { return 0; }
-	STDMETHOD(Drop(IDataObject* pDataObj, DWORD grfKeyState, POINTL pt, DWORD* pdwEffect)) override {
-		HRESULT result = S_OK;
-		FORMATETC fmt{};
-		fmt.cfFormat = CF_HDROP;
-		fmt.dwAspect = DVASPECT_CONTENT;
-		fmt.lindex = -1;
-		fmt.tymed = TYMED_HGLOBAL;
-		STGMEDIUM medium{};
-		if (SUCCEEDED(pDataObj->GetData(&fmt, &medium))) {
-			auto fileCount = DragQueryFileW((HDROP)medium.hGlobal, ~0, 0, 0);
-			for (u32 i = 0; i < fileCount; ++i) {
-				auto pathLength = DragQueryFileW((HDROP)medium.hGlobal, i, 0, 0) + 1;
-				auto path = (wchar *)malloc(pathLength * sizeof(wchar));
-				DragQueryFileW((HDROP)medium.hGlobal, i, path, pathLength);
-				if (loadScene(currentScene, path)) {
-					targetCameraDistance = currentScene->cameraDistance;
-				} else {
-					result = S_FALSE;
-				}
+}
+void *getOrLoadImageData(Span<wchar const> path) {
+	SCOPED_LOCK(loadedImagesMutex);
+
+	auto str = std::wstring(path.data(), path.size());
+	auto &img = allLoadedImages[str];
+	if (!img.refCount) {
+		if (!img.path.size())
+			img.path = str;
+		img.renderData = renderer->createImageData();
+		renderer->setUnloadedTexture(img.renderData);
+		imagesToLoad.push(&img);
+	}
+	++img.refCount;
+	return img.renderData;
+}
+
+void cleanup(Entity &e) {
+	LOG("cleanup(%{%})", toString(e.type), e.id);
+	renderer->releaseEntity(e);
+	switch (e.type) {
+		case Entity_image:
+			ungetImageData(e.image.path);
+			DEALLOCATE(TL_DEFAULT_ALLOCATOR, e.image.path.data());
+			break;
+		case Entity_pencil: 
+		case Entity_line:   
+		case Entity_grid:   
+		case Entity_circle:
+			break;
+
+		default: INVALID_CODE_PATH();
+	}
+	e.reset();
+}
+
+Action *pushAction(Scene *scene, Action &&a) {
+	if (scene->postLastVisibleActionIndex != scene->actions.size()) {
+		for (umm i = scene->postLastVisibleActionIndex; i < scene->actions.size(); ++i) {
+			auto &action = scene->actions[i];
+			switch (action.type)
+			{
+			case Action_create: {
+				auto &create = action.create;
+				cleanup(scene->entities.at(create.targetId));
+				scene->entities.erase(create.targetId);
+			} break;
+			case Action_translate:
+			case Action_rotate:
+			case Action_scale:
+				break;
+			default:
+				INVALID_CODE_PATH();
 				break;
 			}
-			DragFinish((HDROP)medium.hGlobal);
-			ReleaseStgMedium(&medium);
 		}
-		return result;
+		scene->actions.resize(scene->postLastVisibleActionIndex);
 	}
-};
-
-DropTargetImpl dropTarget;
-
-u64 getHash(Scene const *scene);
-void exitAppAbnormal();
-
-void hideConsoleWindow() { ShowWindow(consoleWindow, SW_HIDE); consoleIsVisible = false; }
-void showConsoleWindow() { ShowWindow(consoleWindow, SW_SHOW); consoleIsVisible = true; }
-void toggleConsoleWindow() {
-	ShowWindow(consoleWindow, consoleIsVisible ? SW_HIDE : SW_SHOW);
-	consoleIsVisible = !consoleIsVisible;
-}
-void initLocalization() {
-	wchar localeBuf[LOCALE_NAME_MAX_LENGTH];
-	if (GetUserDefaultLocaleName(localeBuf, countof(localeBuf))) {
-		LOGW(L"Locale: %s", localeBuf);
-		wchar *dash = wcsstr(localeBuf, L"-");
-		if (dash) {
-			*dash = L'\0';
-			     if (wcscmp(localeBuf, L"en") == 0) { language = Language_english; }
-			else if (wcscmp(localeBuf, L"ru") == 0) { language = Language_russian; }
-			else                                    { language = Language_english; }
-		}
-	} else {
-		LOG("GetUserDefaultLocaleName failed. GetLastError = 0x%x", GetLastError());
-		language = Language_english;
-	}
-	localizations[Language_english].windowTitle_path_gridSize = L"Drawt - %s - Scene %u - Grid size: %u";
-	localizations[Language_english].windowTitle_path          = L"Drawt - %s - Scene %u";
-	localizations[Language_english].windowTitle_gridSize      = L"Drawt - <untitled> - Scene %u - Grid size: %u";
-	localizations[Language_english].windowTitle               = L"Drawt - <untitled> - Scene %u";
-	localizations[Language_english].warning                   = L"Warning!";
-	localizations[Language_english].fileFilter                = L"Drawt scene\0*.drawt\0";
-	localizations[Language_english].saveFileTitle             = L"Save Drawt Scene";
-	localizations[Language_english].openFileTitle             = L"Open Drawt Scene";
-	localizations[Language_english].unsavedScene              = L"This scene has unsaved changes. Discard?";
-	localizations[Language_english].unsavedScenes             = L"There are unsaved scenes. Exit?";
-
-	localizations[Language_russian].windowTitle_path_gridSize = L"Drawt - %s - Сцена %u - Размер сетки: %u";
-	localizations[Language_russian].windowTitle_path          = L"Drawt - %s - Сцена %u";
-	localizations[Language_russian].windowTitle_gridSize      = L"Drawt - <untitled> - Сцена %u - Размер сетки: %u";
-	localizations[Language_russian].windowTitle               = L"Drawt - <untitled> - Сцена %u";
-	localizations[Language_russian].warning                   = L"Внимание!";
-	localizations[Language_russian].fileFilter                = L"Drawt сцена\0*.drawt\0";
-	localizations[Language_russian].saveFileTitle             = L"Сохранить Drawt сцену";
-	localizations[Language_russian].openFileTitle             = L"Открыть Drawt сцену";
-	localizations[Language_russian].unsavedScene              = L"Эта сцена не сохранена. Продолжить?";
-	localizations[Language_russian].unsavedScenes             = L"Не все сцены сохранены. Выйти?";
-}
-void initGlobals(HINSTANCE instance) {
-	TIMED_FUNCTION;
-	emptySceneHash = getHash(scenes + 0);
-	executableDirectory.resize(512);
-	GetModuleFileNameW(instance, executableDirectory.data(), executableDirectory.size() + 1);
-	executableDirectory.resize(executableDirectory.rfind(L'\\') + 1);
-	logFile = _wfopen((executableDirectory + L"log.txt").data(), L"w");
-	QueryPerformanceFrequency(&performanceFrequncy);
-
-	{TIMED_BLOCK("AllocConsole");
-		AllocConsole();
-		consoleWindow = GetConsoleWindow();
-		hideConsoleWindow();
-
-		SetConsoleCtrlHandler([](DWORD CtrlType) -> BOOL {
-			switch (CtrlType) {
-				case CTRL_C_EVENT:
-					hideConsoleWindow();
-					return true;
-				case CTRL_CLOSE_EVENT:
-					exitAppAbnormal();
-					return true;
-				default:
-					return false;
-			}
-		}, true);
-
-		freopen("CONOUT$", "w", stdout);
-	}
-
-	initThreadPool(&threadPool, 4);
+	LOG("pushAction(scenes[%], %)", indexof(scene), toString(a.type));
+	scene->actions.push_back(std::move(a));
+	scene->postLastVisibleActionIndex++;
+	scene->modifiedPostLastVisibleActionIndex = min(scene->modifiedPostLastVisibleActionIndex, scene->postLastVisibleActionIndex);
+	scene->showAsterisk = true;
+	updateWindowText = true;
+	return &scene->actions.back();
 }
 
-bool equals(Scene const *sa, Scene const *sb) {
-	if (sa->postLastVisibleActionIndex != sb->postLastVisibleActionIndex)
+Entity *pushEntity(Scene *scene, Entity &&e) {
+	ASSERT(e.id == invalidEntityId, "pushEntity: Entity already registered");
+	
+	auto id = scene->entityIdCounter++;
+
+	CreateAction create = {};
+	create.targetId = id;
+	pushAction(currentScene, std::move(create));
+	
+	e.id = id;
+	e.visible = true;
+	LOG("pushEntity(scenes[%], %{%})", indexof(scene), toString(e.type), id);
+	scene->entities.emplace(id, std::move(e));
+
+	// TODO: maybe dont search???
+	return &scene->entities.at(id);
+}
+
+bool loadImageInfo(ImageEntity &image) {
+	auto imageFile = _wfopen(nullTerminate(image.path).data(), L"rb");
+	if (!imageFile) {
+		LOGW(L"Failed to load file: %", image.path);
 		return false;
-	for (u32 i = 0; i < sa->postLastVisibleActionIndex; ++i) {
-		auto &a = sa->actions[i];
-		auto &b = sb->actions[i];
-		if(a.type != b.type)
-			return false;
+	}
+	DEFER { fclose(imageFile); };
+
+	int width, height;
+	if (!stbi_info_from_file(imageFile, &width, &height, 0)) {
+		LOGW(L"Failed stbi_info_from_file: %", image.path);
+		return false;
+	}
+
+	image.size.x = width;
+	image.size.y = height;
+	image.initialAspectRatio = image.size.x / image.size.y;
+	return true;
+}
+
+void app_onWindowClose() {
+	app_tryExit();
+}
+void app_onWindowResize() {
+	if (renderer) {
+		resizeRenderTargets();
+		currentScene->matrixSceneToNDCDirty = true;
+		windowSizeDirty = true;
+		renderer->repaint(false, false);
+	}
+	
+	toolImageSize = 1 << max(findHighestOneBit(minWindowDim / 16), 4);
+	pieMenuSize = toolImageSize * 3;
+}
+void app_onWindowMove() {
+	if (renderer) {
+		needRepaint = true;
+		renderer->repaint(false, false);
+	}
+}
+void app_onDragAndDrop(Span<Span<wchar>> paths) {
+	for (auto path : paths) {
+		bool freePath = true;
+		DEFER {
+			if (freePath)
+				DEALLOCATE(TL_DEFAULT_ALLOCATOR, path.data());
+		};
+		setToLowerCase(path);
+		if (endsWith(path.data(), L".drawt")) {
+			if (proceedCloseScene()) {
+				app_loadScene(currentScene, path.data());
+				generateGfxData(currentScene);
+				updateWindowText = true;
+			}
+			break;
+		} else if (endsWith(path.data(), L".png") ||
+			       endsWith(path.data(), L".jpg") ||
+			       endsWith(path.data(), L".jpeg") ||
+			       endsWith(path.data(), L".bmp") ||
+			       endsWith(path.data(), L".tga") ||
+			       endsWith(path.data(), L".gif")) {
+
+			freePath = false;
+
+			ImageEntity image;
+			image.path = path;
+			if (loadImageInfo(image)) {
+				image.size /= max(image.size.x, image.size.y);
+				image.size *= currentScene->cameraDistance * min(clientSize.x, clientSize.y) * 0.5f;
+				image.position = mouseScenePos;
+				image.renderData = getOrLoadImageData(image.path);
+				if (image.renderData) {
+					currentScene->needRepaint = true;
+				}
+				
+				calculateBounds(*pushEntity(currentScene, std::move(image)));
+			}
+		} else {
+			LOGW(L"Unknown file format: %", path.data());
+		}
+	}
+}
+
+void initLocalization() {
+	Localization *loc;
+
+	loc = &localizations[Language_english];
+	loc->windowTitlePrefix             = L"Drawt - Scene #% - ";
+	loc->windowTitle_path_gridSize     = L"%% - Grid size: %x%";
+	loc->windowTitle_path              = L"%%";
+	loc->windowTitle_untitled_gridSize = L"*untitled* - Grid size: %x%";
+	loc->windowTitle_untitled          = L"*untitled*";
+	loc->warning                       = L"Warning!";
+	loc->fileFilter                    = L"Drawt scene\0*.drawt\0";
+	loc->saveFileTitle                 = L"Save Drawt Scene";
+	loc->openFileTitle                 = L"Open Drawt Scene";
+	loc->unsavedScene                  = L"This scene has unsaved changes. Discard?";
+	loc->unsavedScenes                 = L"There are unsaved scenes. Exit?";
+	loc->sceneAlreadyExists            = L"Scene with this name already exists. Overwrite?";
+
+	loc = &localizations[Language_russian];
+	loc->windowTitlePrefix             = L"Drawt - Сцена #% - ";
+	loc->windowTitle_path_gridSize     = L"%% - Размер сетки: %x%";
+	loc->windowTitle_path              = L"%%";
+	loc->windowTitle_untitled_gridSize = L"*untitled* - Размер сетки: %x%";
+	loc->windowTitle_untitled          = L"*untitled*";
+	loc->warning                       = L"Внимание!";
+	loc->fileFilter                    = L"Drawt сцена\0*.drawt\0";
+	loc->saveFileTitle                 = L"Сохранить Drawt сцену";
+	loc->openFileTitle                 = L"Открыть Drawt сцену";
+	loc->unsavedScene                  = L"Эта сцена не сохранена. Продолжить?";
+	loc->unsavedScenes                 = L"Не все сцены сохранены. Выйти?";
+	loc->sceneAlreadyExists            = L"Сцена с таким именем уже существует. Перезаписать?";
+}
+
+void initGlobals() {
+	initThreadPool(&threadPool, 4);
+
+	emptySceneHash = getSceneHash(scenes + 0);
+}
+
+template <class Callback, class GetAction, class GetEntity, class OnActionAdded, class OnEntityAdded, class Revert>
+bool traverseSceneSaveableData(Scene *scene, Callback &&callback, GetAction &&getAction, GetEntity &&getEntity, OnActionAdded &&onActionAdded, OnEntityAdded &&onEntityAdded, Revert &&revert, bool ignoreUnnecessary = false) {
+
+#define CALLBACK(x, size) if (!callback(x, size, #x)) return false
+#define VAR_CALLBACK(x) CALLBACK(&x, sizeof(x))
+
+	constexpr u32 defaultSignature = 'twrd';
+	u32 signature = defaultSignature;
+	VAR_CALLBACK(signature);
+	if (signature != defaultSignature) {
+		LOG("This is not a .drawt file (signature missing)");
+		return false;
+	}
+	
+	auto version = CURRENT_VERSION;
+	VAR_CALLBACK(version);
+	if (version != CURRENT_VERSION) {
+		LOG("Warning! This file was saved using another version of the program");
+	}
+
+	if (!ignoreUnnecessary) {
+		VAR_CALLBACK(scene->cameraDistance);
+		VAR_CALLBACK(scene->cameraPosition);
+		VAR_CALLBACK(scene->tool);
+		VAR_CALLBACK(scene->drawColor);
+		VAR_CALLBACK(scene->windowDrawThickness);
+	}
+	VAR_CALLBACK(scene->postLastVisibleActionIndex);
+	VAR_CALLBACK(scene->canvasColor); 
+	VAR_CALLBACK(scene->entityIdCounter);
+	for (u32 i = 0; i < scene->postLastVisibleActionIndex; ++i) {
+		decltype(auto) a = getAction();
+		VAR_CALLBACK(a.type);
 		switch (a.type) {
-			case ActionType_none:
-				return true;
-			case ActionType_pencil: {
-				auto &ap = a.pencil;
-				auto &bp = b.pencil;
-				if (ap.lines.size() != bp.lines.size())
-					return false;
-				if (!memequ(ap.lines.data(), bp.lines.data(), sizeof(Line) * ap.lines.size()))
-					return false;
+			case Action_create: {
+				auto &create = a.create;
+				VAR_CALLBACK(create.targetId);
+				decltype(auto) e = getEntity(create.targetId);
+				VAR_CALLBACK(e.type);
+				VAR_CALLBACK(e.position);
+				VAR_CALLBACK(e.rotation);
+				VAR_CALLBACK(e.visible);
+				switch (e.type) {
+					case Entity_pencil: {
+						PencilEntity &pencil = e.pencil;
+						VAR_CALLBACK(pencil.color);
+						u32 lineCount = pencil.lines.size();
+						VAR_CALLBACK(lineCount);
+						if (lineCount == 0) {
+							LOG("pencil.lines.size() is zero");
+							return false;
+						}
+						if (pencil.lines.size() != lineCount) {
+							pencil.lines.resize(lineCount);
+						}
+						auto lineData = pencil.lines.data();
+						CALLBACK(lineData, lineCount * sizeof(Line));
+					} break;
+					case Entity_line: {
+						LineEntity &line = e.line;
+						VAR_CALLBACK(line.color);
+						VAR_CALLBACK(line.line);
+					} break;
+					case Entity_grid: {
+						GridEntity &grid = e.grid;
+						VAR_CALLBACK(grid.color);
+						VAR_CALLBACK(grid.thickness);
+						VAR_CALLBACK(grid.size);
+						VAR_CALLBACK(grid.cellCount.x);
+						VAR_CALLBACK(grid.cellCount.y);
+					} break;
+					case Entity_circle: {
+						CircleEntity &circle = e.circle;
+						VAR_CALLBACK(circle.color);
+						VAR_CALLBACK(circle.thickness);
+						VAR_CALLBACK(circle.radius);
+					} break;
+					case Entity_image: {
+						ImageEntity &image = e.image;
+						VAR_CALLBACK(image.size);
+						u16 len = image.path.size();
+						VAR_CALLBACK(len);
+						if (image.path.size() != len) {
+							DEALLOCATE(TL_DEFAULT_ALLOCATOR, image.path.data());
+							image.path = {ALLOCATE_T(TL_DEFAULT_ALLOCATOR, wchar, len, 0), len};
+						}
+						wchar *data = image.path.data();
+						CALLBACK(data, len * sizeof(wchar));
+					} break;
+					default: 
+						LOG("invalid entity");
+						return false;
+				}
+				onEntityAdded(e);
 			} break;
-			case ActionType_line:{
-				auto &al = a.line;
-				auto &bl = b.line;
-				if (!memequ(&al.line, &bl.line, sizeof(Line)))
-					return false;
+			case Action_translate: {
+				auto &translate = a.translate;
+				VAR_CALLBACK(translate.targetId);
+				VAR_CALLBACK(translate.startPosition);
+				VAR_CALLBACK(translate.endPosition);
 			} break;
-			case ActionType_grid:{
-				auto &ag = a.grid;
-				auto &bg = b.grid;
-				if (!memequ(&ag.startPoint, &bg.startPoint, sizeof(ag.startPoint))) return false;
-				if (!memequ(&ag.endPosition, &bg.endPosition, sizeof(ag.endPosition))) return false;
-				if (!memequ(&ag.cellCount, &bg.cellCount, sizeof(ag.cellCount))) return false;
+			case Action_rotate: {
+				auto &rotate = a.rotate;
+				VAR_CALLBACK(rotate.targetId);
+				VAR_CALLBACK(rotate.startAngle);
+				VAR_CALLBACK(rotate.endAngle);
 			} break;
+			case Action_scale: {
+				auto &scale = a.scale;
+				VAR_CALLBACK(scale.targetId);
+				VAR_CALLBACK(scale.startPosition);
+				VAR_CALLBACK(scale.endPosition);
+				VAR_CALLBACK(scale.startSize);
+				VAR_CALLBACK(scale.endSize);
+			} break;
+			default: 
+				LOG("invalid action"); 
+				return false;
+		}
+		onActionAdded(a);
+	}
+	return true;
+}
+bool equals(Entity const &ea, Entity const &eb) {
+	if (ea.type != eb.type) return false;
+	if (ea.position != eb.position) return false;
+	if (ea.rotation != eb.rotation) return false;
+	switch (ea.type) {
+		case Entity_pencil: {
+			auto &a = ea.pencil;
+			auto &b = eb.pencil;
+			if (!memequ(&a.color, &b.color, sizeof(a.color))) return false;
+			if (a.lines.size() != b.lines.size()) return false;
+			if (!memequ(a.lines.data(), b.lines.data(), sizeof(Line) * a.lines.size())) return false;
+		} break;
+		case Entity_line: {
+			auto &a = ea.line;
+			auto &b = eb.line;
+			if (!memequ(&a.color, &b.color, sizeof(a.color))) return false;
+			if (!memequ(&a.line, &b.line, sizeof(Line))) return false;
+		} break;
+		case Entity_grid: {
+			auto &a = ea.grid;
+			auto &b = eb.grid;
+			if (!memequ(&a.color, &b.color, sizeof(a.color))) return false;
+			if (!memequ(&a.thickness, &b.thickness, sizeof(a.thickness))) return false;
+			if (!memequ(&a.size, &b.size, sizeof(a.size))) return false;
+			if (!memequ(&a.cellCount, &b.cellCount, sizeof(a.cellCount))) return false;
+		} break;
+		case Entity_circle: {
+			auto &a = ea.circle;
+			auto &b = eb.circle;
+			if (!memequ(&a.color, &b.color, sizeof(a.color))) return false;
+			if (!memequ(&a.thickness, &b.thickness, sizeof(a.thickness))) return false;
+			if (!memequ(&a.radius, &b.radius, sizeof(a.radius))) return false;
+		} break;
+		case Entity_image: {
+			auto &a = ea.image;
+			auto &b = eb.image;
+			if (!memequ(&a.size, &b.size, sizeof(a.size))) return false;
+			if (!equals(a.path, b.path)) return false;
+		} break;
+		default: INVALID_CODE_PATH();
+	}
+	return true;
+}
+bool equals(Scene *sceneA, Scene *sceneB) {
+	if (sceneA->postLastVisibleActionIndex != sceneB->postLastVisibleActionIndex) return false;
+	if (!memequ(&sceneA->canvasColor, &sceneB->canvasColor, sizeof(sceneA->canvasColor))) return false;
+	for (u32 i = 0; i < sceneA->postLastVisibleActionIndex; ++i) {
+		Action const &actionA = sceneA->actions[i];
+		Action const &actionB = sceneB->actions[i];
+		if(actionA.type != actionB.type)
+			return false;
+		switch (actionA.type) {
+			case Action_create: {
+				auto &a = actionA.create;
+				auto &b = actionB.create;
+				if (!memequ(&a.targetId, &b.targetId, sizeof(a.targetId))) return false;
+				if (!equals(sceneA->entities.at(a.targetId), sceneB->entities.at(b.targetId))) return false;
+			} break;
+			case Action_translate: {
+				auto &a = actionA.translate;
+				auto &b = actionB.translate;
+				if (!memequ(&a.targetId, &b.targetId, sizeof(a.targetId))) return false;
+				if (!memequ(&a.startPosition, &b.startPosition, sizeof(a.startPosition))) return false;
+				if (!memequ(&a.endPosition, &b.endPosition, sizeof(a.endPosition))) return false;
+			} break;
+			case Action_rotate: {
+				auto &a = actionA.rotate;
+				auto &b = actionB.rotate;
+				if (!memequ(&a.targetId, &b.targetId, sizeof(a.targetId))) return false;
+				if (!memequ(&a.startAngle, &b.startAngle, sizeof(a.startAngle))) return false;
+				if (!memequ(&a.endAngle, &b.endAngle, sizeof(a.endAngle))) return false;
+			} break;
+			case Action_scale: {
+				auto &a = actionA.scale;
+				auto &b = actionB.scale;
+				if (!memequ(&a.targetId, &b.targetId, sizeof(a.targetId))) return false;
+				if (!memequ(&a.startPosition, &b.startPosition, sizeof(a.startPosition))) return false;
+				if (!memequ(&a.endPosition, &b.endPosition, sizeof(a.endPosition))) return false;
+				if (!memequ(&a.startSize, &b.startSize, sizeof(a.startSize))) return false;
+				if (!memequ(&a.endSize, &b.endSize, sizeof(a.endSize))) return false;
+			} break;
+			default: INVALID_CODE_PATH();
 		}
 	}
 	return true;
 }
 
-u64 addHash(u64 v, u64 acc) { return acc ^ rotateLeft(acc ^ 0xB0A82D45578D69D6, (acc ^ 0x21) & 63) ^ v; }
-u64 getHash(u32 v) { return (v | ((u64)v << 32)) ^ 0xF7E6D5C4B3A29180; }
-u64 getHash(f32 v) { return getHash(*(u32 *)&v); }
-u64 getHash(u64 v) { return v; }
-u64 getHash(v2f v) { return *(u64 *)&v; }
-u64 getHash(v3f v) { return ((u64 *)&v)[0] ^ ((u32 *)&v)[2]; }
-u64 getHash(v4f v) { return ((u64 *)&v)[0] ^ ((u64 *)&v)[1]; }
-u64 getHash(Point const &point) { return addHash(getHash(point.position), getHash(point.thickness)); }
-u64 getHash(Line const &line) { return addHash(getHash(line.a), getHash(line.b)); }
-u64 getHash(Scene const *scene) {
+u64 getSceneHash(Scene *scene) {
 	u64 result = 0x0123456789ABCDEF;
-	auto mix = [&](auto const &v) { result = addHash(getHash(v), result); };
-	mix(scene->postLastVisibleActionIndex);
-	for (u32 i = 0; i < scene->postLastVisibleActionIndex; ++i) {
-		auto &a = scene->actions[i];
-		switch (a.type) {
-			case ActionType_none: {
-				INVALID_CODE_PATH("scene->actions should not contain ActionType_none");
-			} break;
-			case ActionType_pencil: {
-				auto &pencil = a.pencil;
-				mix(pencil.lines.size());
-				for (auto &line : pencil.lines) {
-					mix(line);
-				}
-			} break;
-			case ActionType_line: {
-				auto &line = a.line;
-				mix(line.line);
-			} break;
-			case ActionType_grid: {
-				auto &grid = a.grid;
-				mix(grid.startPoint);
-				mix(grid.endPosition);
-				mix(grid.cellCount);
-			} break;
+	u32 mixIndex = 0;
+	auto mixer = [&](void *data, umm size, char const *name) {
+		while (size >= 8) {
+			result ^= *(u64 *)data;
+			data = (u8 *)data + 8;
+			size -= 8;
 		}
+		while (size >= 4) {
+			((u32 *)&result)[mixIndex & 1] ^= *(u32 *)data;
+			data = (u8 *)data + 4;
+			size -= 4;
+			++mixIndex;
+		}
+		while (size >= 2) {
+			((u16 *)&result)[mixIndex & 3] ^= *(u16 *)data;
+			data = (u8 *)data + 2;
+			size -= 2;
+			++mixIndex;
+		}
+		while (size) {
+			((u8 *)&result)[mixIndex & 7] ^= *(u8 *)data;
+			data = (u8 *)data + 1;
+			size -= 1;
+			++mixIndex;
+		}
+		return true;
+	};
+	auto actionIterator = scene->actions.begin();
+	auto getAction = [&]() -> Action & { return *actionIterator++; };
+	auto getEntity = [&](EntityId id) -> Entity & { return scene->entities.at(id); };
+	auto empty = [](auto&){};
+	auto revert = [](u32 amount) {
+		INVALID_CODE_PATH("revert should never be called here");
+	};
+	if (!traverseSceneSaveableData(scene, mixer, getAction, getEntity, empty, empty, revert, true)) {
+		INVALID_CODE_PATH("traverseSceneSaveableData should never fail here");
 	}
 	return result;
 }
 
 void initializeScene(Scene *scene) {
-	TIMED_FUNCTION;
 	scene->initialized = true;
 	scene->savedHash = emptySceneHash;
-
-	D3D11_BUFFER_DESC d{};
-	d.ByteWidth = sizeof(scene->constantBufferData);
-	d.Usage = D3D11_USAGE_DEFAULT;
-	d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	DHR(d3d11State.device->CreateBuffer(&d, 0, &scene->constantBuffer));
-	scene->constantBufferData.drawThickness = scene->drawThickness;
+	renderer->initScene(scene);
 }
 
 bool keyHeld(u32 k) { return keysHeld[k]; }
@@ -630,955 +662,230 @@ bool keyChanged(u32 k) { return keyDown(k) || keyUp(k); }
 bool mouseButtonHeld(u32 k) { return mouseButtons[k]; }
 bool mouseButtonDown(u32 k) { return mouseButtons[k] && !prevMouseButtons[k]; }
 bool mouseButtonUp(u32 k) { return !mouseButtons[k] && prevMouseButtons[k]; }
-bool cursorHeld() { return mouseButtonHeld(0); }
-bool cursorDown() { return mouseButtonDown(0); }
-bool cursorUp() { return mouseButtonUp(0); }
 
-f32 getDrawThickness(Scene const *scene) { return scene->drawThickness * scene->cameraDistance; }
+v2f clientToScenePos(v2f screenPos) { return (screenPos - 0.5f * (v2f)clientSize) * currentScene->cameraDistance + currentScene->cameraPosition; }
+v2f clientToScenePos(v2s screenPos) { return clientToScenePos((v2f)screenPos); }
+v2f sceneToClientPos(v2f scenePos) { return (scenePos - currentScene->cameraPosition) / currentScene->cameraDistance + 0.5f * (v2f)clientSize; }
+Optional<Point> getEndpoint(Scene *scene, EntityId excludeId) {
+	if (scene->postLastVisibleActionIndex == 0)
+		return {};
 
-v2f getWorldPos(v2s screenPos) { return currentScene->cameraPosition + ((v2f)screenPos - 0.5f * (v2f)windowSize) * currentScene->cameraDistance; }
-Point const *getEndpoint(Action const &action) {
-	switch (action.type) {
-		case ActionType_pencil: return &action.pencil.lines.back().b;
-		case ActionType_line: return &action.line.line.b;
-		case ActionType_grid:
-		case ActionType_none: return (Point const *)0;
+	Action const *action = scene->actions.end();
+
+	while (1) {
+		do {
+			action--;
+			if (action < scene->actions.begin())
+				return {};
+		} while (action->type != Action_create);
+		if (action->create.targetId == excludeId)
+			continue;
+		auto &e = scene->entities.at(action->create.targetId);
+		Point result;
+		switch (e.type) {
+			case Entity_pencil: 
+				result = e.pencil.lines.back().b;
+				break;
+			case Entity_line: 
+				result = e.line.line.b;
+				break;
+			case Entity_grid:
+			case Entity_circle:
+			case Entity_image: 
+				continue;
+			default: INVALID_CODE_PATH();
+		}
+		result.position += e.position;
+		return result;
 	}
-	INVALID_CODE_PATH();
 }
 
-TransformedLine transform(Line line) {
-	TransformedLine result;
-	m2 rotation = m2::rotation(atan2(line.b.position - line.a.position));
-	result.a.transform = m2::scaling(line.a.thickness) * rotation;
-	result.b.transform = m2::scaling(line.b.thickness) * rotation;
-	result.a.position = line.a.position;
-	result.b.position = line.b.position;
-	return result;
-}
-
-void pushLine(PencilAction &pencil, Line line) {
+void pushLine(PencilEntity &pencil, Line line) {
 	pencil.lines.push_back(line);
-	pencil.transformedLines.push_back(transform(line));
-}
-
-void cleanup(Action &action) {
-	switch (action.type) {
-		case ActionType_pencil: release(action.pencil.lineBuffer); break;
-		case ActionType_line:   release(action.line.buffer); break;
-		case ActionType_grid:   release(action.grid.buffer); break;
-		case ActionType_none: break;
-	}
+	renderer->onLinePushed(pencil, line);
 }
 
 void resizeRenderTargets() {
-	release(d3d11State.backBuffer);
-
-	DHR(d3d11State.swapChain->ResizeBuffers(1, windowSize.x, windowSize.y, DXGI_FORMAT_UNKNOWN, 0));
-
-	d3d11State.createBackBuffer();
+	renderer->resize();
 
 	for (auto &scene : scenes) {
 		scene.needResize = true;
 	}
 }
 
-ID3D11VertexShader *createVertexShader(char const *src, umm srcSize, char const *name) {
-	ID3DBlob *bc;
-	ID3DBlob *errors;
-	HRESULT compileResult = D3DCompile(src, srcSize, name, 0, 0, "main", "vs_5_0", 0, 0, &bc, &errors);
-	if (errors) {
-		LOG("%s", (char *)errors->GetBufferPointer());
-		errors->Release();
+void closeScene(Scene *scene) {
+	for (auto &[id, e] : scene->entities) {
+		cleanup(e);
 	}
-	if (FAILED(compileResult)) {
-		LOG("VS compilation failed");
-		DHR(compileResult);
-	}
-	ID3D11VertexShader *result;
-	DHR(d3d11State.device->CreateVertexShader(bc->GetBufferPointer(), bc->GetBufferSize(), 0, &result));
-	bc->Release();
-	return result;
+	scene->entities.clear();
+	scene->actions.clear();
+	scene->postLastVisibleActionIndex = 0;
+	scene->needRepaint = true;
+	scene->savedHash = emptySceneHash;
+	scene->entityIdCounter = 0;
+	scene->path = {};
 }
-ID3D11PixelShader *createPixelShader(char const *src, umm srcSize, char const *name) {
-	ID3DBlob *bc;
-	ID3DBlob *errors;
-	HRESULT compileResult = D3DCompile(src, srcSize, name, 0, 0, "main", "ps_5_0", 0, 0, &bc, &errors);
-	if (errors) {
-		LOG("%s", (char *)errors->GetBufferPointer());
-		errors->Release();
-	}
-	if (FAILED(compileResult)) {
-		LOG("VS compilation failed");
-		DHR(compileResult);
-	}
-	ID3D11PixelShader *result;
-	DHR(d3d11State.device->CreatePixelShader(bc->GetBufferPointer(), bc->GetBufferSize(), 0, &result));
-	bc->Release();
-	return result;
-}
-#if OS_WINDOWS
-#define SCENE_CBUFFER_SOURCE \
-R"(\
-cbuffer _ : register(b0) {\
-	float2 scenePosition;\
-	float2 sceneScale;\
-	float3 drawColor;\
-	float drawThickness;\
-	float2 mouseWorldPos;\
-}\
-float2 sceneToNDC(float2 p) { return (p - scenePosition) * sceneScale; }\
-float2 sceneToNDC(float2 p, float2 offset) { return (p - scenePosition + offset) * sceneScale; }\
-)"
-#define GLOBAL_CBUFFER_SOURCE \
-R"(\
-cbuffer _ : register(b1) {\
-	float4x4 matrixWindowToNDC;\
-	float2 windowSize;\
-	float windowAspect;\
-};\
-)"
-#define PIE_CBUFFER_SOURCE \
-R"(\
-cbuffer _ : register(b2) {\
-	float2 piePos;\
-	float pieAngle;\
-	float pieSize;\
-	float pieAlpha;\
-}\
-)"
-#define COLOR_CBUFFER_SOURCE \
-R"(\
-cbuffer _ : register(b3) {\
-	float2 colorMenuPos;\
-	float colorMenuSize;\
-	float colorMenuAlpha;\
-	float3 colorMenuHueColor;\
-}\
-)"
-#define ACTION_CBUFFER_SOURCE \
-R"(\
-cbuffer _ : register(b4) {\
-	float3 actionColor;\
-}\
-)"
 
-void initLineShader() {
-	TIMED_FUNCTION;
-	char vertexShaderSourceData[1024*3];
-	u32 const vertexShaderSourceSize = sprintf_s(vertexShaderSourceData, sizeof(vertexShaderSourceData), SCENE_CBUFFER_SOURCE R"(
-#define VERTICES_PER_LINE_COUNT %u
-
-struct Point {
-	float2x2 transform;
-	float2 position;
-};
-struct Line {
-	Point a, b;
-};
-StructuredBuffer<Line> lines : register(t0);
-
-struct Vertex {
-	float2 position;
-	float t;
-};
-struct Out {
-	float4 position : SV_Position;
-};
-struct In {
-	uint id : SV_VertexId;
-};
-
-#define maxx 0.5f
-#define SIN(x) (sin((x) / 180.0f * 3.1415926535897932384626433832795f) * maxx)
-#define COS(x) (cos((x) / 180.0f * 3.1415926535897932384626433832795f) * maxx)
-#define CS(x) {COS(x),SIN(x)}
-
-#define HALF(x, a, b)								        \
-	{CS(x+270  ), a}, {CS(x+ 90  ), a}, {CS(x+270  ), b},   \
-	{CS(x+180  ), a}, {CS(x+ 90  ), a}, {CS(x+270  ), a},	\
-	{CS(x+135  ), a}, {CS(x+ 90  ), a}, {CS(x+180  ), a},	\
-	{CS(x+112.5), a}, {CS(x+ 90  ), a}, {CS(x+135  ), a},	\
-	{CS(x+157.5), a}, {CS(x+135  ), a}, {CS(x+180  ), a},	\
-	{CS(x+225  ), a}, {CS(x+180  ), a}, {CS(x+270  ), a},	\
-	{CS(x+202.5), a}, {CS(x+180  ), a}, {CS(x+225  ), a},	\
-	{CS(x+247.5), a}, {CS(x+225  ), a}, {CS(x+270  ), a}
-
-static const Vertex vertexBuffer[] = {
-	HALF(  0, 0, 1),
-	HALF(180, 1, 0),
-};
-float4 main(in In i) : SV_Position {
-	Out o;
-	Vertex vertex = vertexBuffer[i.id %% VERTICES_PER_LINE_COUNT];
-	Line l = lines[i.id / VERTICES_PER_LINE_COUNT];
-	float2x2 transform = lerp(l.a.transform, l.b.transform, vertex.t);
-	float2 position = lerp(l.a.position, l.b.position, vertex.t);
-	return float4(sceneToNDC(mul(transform, vertex.position) + position), 0, 1);
-}
-)", vertexPerLineCount);
-	lineShader.vs = createVertexShader(vertexShaderSourceData, vertexShaderSourceSize, "line_vs");
-
-	char pixelShaderSourceData[] = ACTION_CBUFFER_SOURCE R"(
-float4 main() : SV_Target {
-	return float4(actionColor, 1.0f);
-}
-)";
-	u32 const pixelShaderSourceSize = sizeof(pixelShaderSourceData);
-	lineShader.ps = createPixelShader(pixelShaderSourceData, pixelShaderSourceSize, "line_ps");
-}
-void initUIQuadShader() {
-	TIMED_FUNCTION;
-	char vertexShaderSourceData[] = GLOBAL_CBUFFER_SOURCE SCENE_CBUFFER_SOURCE R"(
-struct Out {
-	float2 uv : UV;
-	float4 color : COLOR;
-	float4 position : SV_Position;
-};
-struct In {
-	uint id : SV_VertexId;
-};
-
-struct Quad {
-	float2 position;
-	float2 size;
-	float2 uvMin;
-	float2 uvMax;
-	float4 color;
-};
-StructuredBuffer<Quad> quads : register(t0);
-
-static const float2 vertexData[] = {
-	{0, 0},
-	{0, 1},
-	{1, 0},
-	{0, 1},
-	{1, 1},
-	{1, 0},
-};
-
-Out main(in In i) {
-	Out o;
-
-	Quad quad = quads[i.id / 6];	
-
-	float2 vertexPos = vertexData[i.id % 6];
-
-	o.uv = lerp(quad.uvMin, quad.uvMax, vertexPos);
-	o.position = mul(matrixWindowToNDC, float4(quad.position + vertexPos * quad.size, 0, 1));
-	o.color = quad.color;
-	return o;
-}
-)";
-	u32 const vertexShaderSourceSize = sizeof(vertexShaderSourceData);
-	quadShader.vs = createVertexShader(vertexShaderSourceData, vertexShaderSourceSize, "quad_vs");
-
-	char pixelShaderSourceData[] = R"(
-Texture2D srcTex : register(t0);
-SamplerState samplerState;
-float4 main(in float2 uv : UV, in float4 color : COLOR) : SV_Target {
-	return srcTex.Sample(samplerState, uv) * color;
-}
-)";
-	u32 const pixelShaderSourceSize = sizeof(pixelShaderSourceData);
-	quadShader.ps = createPixelShader(pixelShaderSourceData, pixelShaderSourceSize, "quad_ps");
-}
-void initBlitShader() {
-	TIMED_FUNCTION;
-	char vertexShaderSourceData[] = GLOBAL_CBUFFER_SOURCE R"(
-struct Output {
-	float2 uv : UV;
-	float4 position : SV_Position;
-};
-static const float2 vertexData[] = {
-	{-1,-1},
-	{-1, 3},
-	{ 3,-1},
-};
-void main(in uint id : SV_VertexId, out Output o) {
-	o.uv = (vertexData[id] + 1) * 0.5f;
-	o.uv.y = 1 - o.uv.y;
-	o.uv *= windowSize;
-	o.position = float4(vertexData[id], 0, 1);
-}
-)";
-	u32 const vertexShaderSourceSize = sizeof(vertexShaderSourceData);
-	blitShader.vs = createVertexShader(vertexShaderSourceData, vertexShaderSourceSize, "blit_vs");
-
-	char pixelShaderSourceData[] = R"(
-Texture2D srcTex : register(t0);
-float4 main(in float2 uv : UV) : SV_Target {
-	return srcTex.Load(int3(uv, 0));
-}
-)";
-	u32 const pixelShaderSourceSize = sizeof(pixelShaderSourceData);
-	blitShader.ps = createPixelShader(pixelShaderSourceData, pixelShaderSourceSize, "blit_ps");
-}
-void initBlitShaderMS() {
-	TIMED_FUNCTION;
-	char vertexShaderSourceData[] = GLOBAL_CBUFFER_SOURCE R"(
-struct Output {
-	float2 uv : UV;
-	float4 position : SV_Position;
-};
-static const float2 vertexData[] = {
-	{-1,-1},
-	{-1, 3},
-	{ 3,-1},
-};
-void main(in uint id : SV_VertexId, out Output o) {
-	o.uv = (vertexData[id] + 1) * 0.5f;
-	o.uv.y = 1 - o.uv.y;
-	o.uv *= windowSize;
-	o.position = float4(vertexData[id], 0, 1);
-}
-)";
-	u32 const vertexShaderSourceSize = sizeof(vertexShaderSourceData);
-	blitShaderMS.vs = createVertexShader(vertexShaderSourceData, vertexShaderSourceSize, "blitms_vs");
-
-	char pixelShaderSourceData[1024];
-	u32 const pixelShaderSourceSize = sprintf_s(pixelShaderSourceData, sizeof(pixelShaderSourceData), R"(
-#define MSAA_SAMPLE_COUNT %u
-#if MSAA_SAMPLE_COUNT == 1
-Texture2D srcTex : register(t0);
-float4 main(in float2 uv : UV) : SV_Target {
-	return srcTex.Load(uv, 0);
-}
-#else
-Texture2DMS<float4> srcTex : register(t0);
-float4 main(in float2 uv : UV) : SV_Target {
-	float4 color = 0;
-	for (uint i = 0; i < MSAA_SAMPLE_COUNT; ++i)
-		color += srcTex.Load(uv, i);
-	return color / MSAA_SAMPLE_COUNT;// + float4(uv / 1000, 0, 1);
-}
-#endif
-)", msaaSampleCount);
-	blitShaderMS.ps = createPixelShader(pixelShaderSourceData, pixelShaderSourceSize, "blitms_ps");
-}
-void initCircleShader() {
-	TIMED_FUNCTION;
-	char vertexShaderSourceData[] = SCENE_CBUFFER_SOURCE R"(
-#define DEG(x) ((x) / 180.0f * 3.1415926535897932384626433832795f)
-#define STEP 15
-#define LINE(x) {cos(DEG(x)), sin(DEG(x))}, {cos(DEG(x+STEP)), sin(DEG(x+STEP))}
-static const float2 vertexData[] = {
-	LINE(  0), LINE( 15),
-	LINE( 30), LINE( 45),
-	LINE( 60), LINE( 75),
-	LINE( 90), LINE(105),
-	LINE(120), LINE(135),
-	LINE(150), LINE(165),
-	LINE(180), LINE(195),
-	LINE(210), LINE(225),
-	LINE(240), LINE(255),
-	LINE(270), LINE(285),
-	LINE(300), LINE(315),
-	LINE(330), LINE(345),
-};
-float4 main(in uint id : SV_VertexId) : SV_Position {
-	return float4(sceneToNDC(mouseWorldPos, vertexData[id] * 0.5f * drawThickness), 0, 1);
-	//return mul(matrixSceneToNDC, float4(mouseWorldPos + vertexData[id] * 0.5f * drawThickness, 0, 1));
-}
-)";
-	u32 const vertexShaderSourceSize = sizeof(vertexShaderSourceData);
-	circleShader.vs = createVertexShader(vertexShaderSourceData, vertexShaderSourceSize, "circle_vs");
-
-	char pixelShaderSourceData[] = SCENE_CBUFFER_SOURCE R"(
-float4 main() : SV_Target {
-	return float4(drawColor, 1);
-}
-)";
-	u32 const pixelShaderSourceSize = sizeof(pixelShaderSourceData);
-	circleShader.ps = createPixelShader(pixelShaderSourceData, pixelShaderSourceSize, "circle_ps");
-}
-void initPieSelShader() {
-	TIMED_FUNCTION;
-	char vertexShaderSourceData[] = PIE_CBUFFER_SOURCE GLOBAL_CBUFFER_SOURCE R"(
-#define DEG(x) ((x) / 180.0f * 3.1415926535897932384626433832795f)
-#define COS(x) cos(DEG(x))
-#define SIN(x) sin(DEG(x))
-struct Vertex {
-	float2 position;
-	float alpha;
-};
-#define MR 0.05f
-#define MCOS(x) (COS(x)*MR)
-#define MSIN(x) (SIN(x)*MR)
-static const Vertex vertexData[] = {
-	{{0, 0}, 0.5f}, {{-MCOS( 0  ), MSIN( 0  )}, 0.0f}, {{-MCOS(22.5), MSIN(22.5)}, 0.0f},
-	{{0, 0}, 0.5f}, {{-MCOS(22.5), MSIN(22.5)}, 0.0f}, {{-MCOS(45  ), MSIN(45  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{-MCOS(45  ), MSIN(45  )}, 0.0f}, {{  COS(45  ),  SIN(45  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS(45  ),  SIN(45  )}, 0.0f}, {{  COS(44  ),  SIN(44  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS(44  ),  SIN(44  )}, 0.0f}, {{  COS(34  ),  SIN(34  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS(34  ),  SIN(34  )}, 0.0f}, {{  COS(22  ),  SIN(22  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS(22  ),  SIN(22  )}, 0.0f}, {{  COS(11  ),  SIN(11  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS(11  ),  SIN(11  )}, 0.0f}, {{  COS( 0  ),  SIN( 0  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS( 0  ),  SIN( 0  )}, 0.0f}, {{  COS(11  ), -SIN(11  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS(11  ), -SIN(11  )}, 0.0f}, {{  COS(22  ), -SIN(22  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS(22  ), -SIN(22  )}, 0.0f}, {{  COS(34  ), -SIN(34  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS(34  ), -SIN(34  )}, 0.0f}, {{  COS(44  ), -SIN(44  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS(44  ), -SIN(44  )}, 0.0f}, {{  COS(45  ), -SIN(45  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{  COS(45  ), -SIN(45  )}, 0.0f}, {{-MCOS(45  ),-MSIN(45  )}, 0.0f},
-	{{0, 0}, 0.5f}, {{-MCOS(45  ),-MSIN(45  )}, 0.0f}, {{-MCOS(22.5),-MSIN(22.5)}, 0.0f},
-	{{0, 0}, 0.5f}, {{-MCOS(22.5),-MSIN(22.5)}, 0.0f}, {{-MCOS( 0  ),-MSIN( 0  )}, 0.0f},
-};
-void main(out float alpha : ALPHA, out float4 position : SV_Position, in uint id : SV_VertexId) {
-	Vertex v = vertexData[id];
-	float2x2 rotation = {
-		 cos(pieAngle),-sin(pieAngle),
-		 sin(pieAngle), cos(pieAngle),
+StringBuilder<> app_writeScene(Scene *scene) {
+	StringBuilder<> builder;
+	auto appender = [&](void *data, umm size, char const *name) {
+		builder.appendBytes(data, size);
+		return true;
 	};
-	alpha = v.alpha * pieAlpha;
-	position = mul(matrixWindowToNDC, float4(piePos + mul(rotation, v.position) * pieSize * 1.5f, 0, 1));
-}
-)";
-	u32 const vertexShaderSourceSize = sizeof(vertexShaderSourceData);
-	pieSelShader.vs = createVertexShader(vertexShaderSourceData, vertexShaderSourceSize, "pieSel_vs");
-
-	char pixelShaderSourceData[] = SCENE_CBUFFER_SOURCE R"(
-float4 main(in float alpha : ALPHA) : SV_Target {
-	return float4(1, 1, 1, alpha);
-}
-)";
-	u32 const pixelShaderSourceSize = sizeof(pixelShaderSourceData);
-	pieSelShader.ps = createPixelShader(pixelShaderSourceData, pixelShaderSourceSize, "pieSel_ps");
-}
-void initColorMenuShader() {
-	TIMED_FUNCTION;
-	char vertexShaderSourceData[] = COLOR_CBUFFER_SOURCE GLOBAL_CBUFFER_SOURCE SCENE_CBUFFER_SOURCE R"(
-static const float3 vertexData[] = {
-	{-0.05,-0.05, 1},
-	{-0.05, 1.05, 1},
-	{ 1.05,-0.05, 1},
-	{-0.05, 1.05, 1},
-	{ 1.05, 1.05, 1},
-	{ 1.05,-0.05, 1},
-
-	{0, 0, 0},
-	{0, 1, 0},
-	{1, 0, 0},
-	{0, 1, 0},
-	{1, 1, 0},
-	{1, 0, 0},
-};
-void main(out float3 uv : UV, out float4 position : SV_Position, in uint id : SV_VertexId) {
-	float3 v = vertexData[id];
-	uv = v;
-	position = mul(matrixWindowToNDC, float4(colorMenuPos + v.xy * colorMenuSize, 0, 1));
-}
-)";
-	u32 const vertexShaderSourceSize = sizeof(vertexShaderSourceData);
-	colorMenuShader.vs = createVertexShader(vertexShaderSourceData, vertexShaderSourceSize, "colorMenu_vs");
-
-	char pixelShaderSourceData[] = COLOR_CBUFFER_SOURCE SCENE_CBUFFER_SOURCE R"(
-float4 main(in float3 uv : UV) : SV_Target {
-	return float4(lerp(lerp(1, colorMenuHueColor, uv.x) * uv.y, drawColor, uv.z), colorMenuAlpha);
-}
-)";
-	u32 const pixelShaderSourceSize = sizeof(pixelShaderSourceData);
-	colorMenuShader.ps = createPixelShader(pixelShaderSourceData, pixelShaderSourceSize, "colorMenu_ps");
-}
-void setViewport(f32 x, f32 y, f32 w, f32 h) {
-	D3D11_VIEWPORT v{};
-	v.TopLeftX = x;
-	v.TopLeftY = y;
-	v.Width = w;
-	v.Height = h;
-	v.MaxDepth = 1.0f;
-	d3d11State.immediateContext->RSSetViewports(1, &v);
-}
-#endif
-
-bool shouldRepaint(Scene const *scene) {
-	return scene->drawColorDirty || scene->constantBufferDirty || scene->matrixSceneToNDCDirty || scene->needRepaint;
-}
-
-v2u getUv(Tool tool) {
-	switch (tool) {
-		case Tool_pencil: return {0, 1};
-		case Tool_line: return {1, 1};
-		case Tool_grid: return {0, 0};
-		case Tool_dropper: return {1, 0};
-		default:
-			INVALID_CODE_PATH();
-			break;
-	}
-}
-template <class T>
-void setUv(T &quad, v2u uv) {
-	quad.uvMin = V2f(uv.x * 0.25f, uv.y * 0.25f);
-	quad.uvMax = quad.uvMin + 0.25f;
-}
-
-void drawAction(Action const &action) {
-	ActionConstantBufferData actionData;
-	switch (action.type) {
-		case ActionType_none: {
-		} break;
-		case ActionType_pencil: {
-			actionData.color = action.pencil.color;
-			d3d11State.immediateContext->UpdateSubresource(actionConstantBuffer, 0, 0, &actionData, 0, 0);
-			d3d11State.immediateContext->VSSetShader(lineShader.vs, 0, 0);
-			d3d11State.immediateContext->PSSetShader(lineShader.ps, 0, 0);
-			d3d11State.immediateContext->VSSetShaderResources(0, 1, &action.pencil.lineBuffer.srv);
-			d3d11State.immediateContext->Draw(action.pencil.lines.size() * vertexPerLineCount, 0);
-		} break;
-		case ActionType_line: {
-			actionData.color = action.line.color;
-			d3d11State.immediateContext->UpdateSubresource(actionConstantBuffer, 0, 0, &actionData, 0, 0);
-			d3d11State.immediateContext->VSSetShader(lineShader.vs, 0, 0);
-			d3d11State.immediateContext->PSSetShader(lineShader.ps, 0, 0);
-			d3d11State.immediateContext->VSSetShaderResources(0, 1, &action.line.buffer.srv);
-			d3d11State.immediateContext->Draw(vertexPerLineCount, 0);
-		} break;
-		case ActionType_grid: {
-			actionData.color = action.grid.color;
-			d3d11State.immediateContext->UpdateSubresource(actionConstantBuffer, 0, 0, &actionData, 0, 0);
-			d3d11State.immediateContext->VSSetShader(lineShader.vs, 0, 0);
-			d3d11State.immediateContext->PSSetShader(lineShader.ps, 0, 0);
-			d3d11State.immediateContext->VSSetShaderResources(0, 1, &action.grid.buffer.srv);
-			u32 lineCount = action.grid.cellCount * 2 + 2;
-			d3d11State.immediateContext->Draw(lineCount * vertexPerLineCount, 0);
-		} break;
-	}
-}
-void repaintScene(Scene *scene, bool drawCursor) {
-	scene->needRepaint = false;
-	needRepaint = true;
-	
-	if (scene->needResize) {
-		scene->needResize = false;
-		release(scene->canvasRT);
-		release(scene->canvasRTMS);
-		scene->canvasRT = d3d11State.createRenderTexture(windowSize.x, windowSize.y, 1, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_CPU_ACCESS_READ);
-		scene->canvasRTMS = d3d11State.createRenderTexture(windowSize.x, windowSize.y, msaaSampleCount, DXGI_FORMAT_R8G8B8A8_UNORM);
-	}
-
-	if (scene->matrixSceneToNDCDirty) {
-		scene->matrixSceneToNDCDirty = false;
-		scene->constantBufferDirty = true;
-		scene->constantBufferData.scenePosition = scene->cameraPosition;
-		scene->constantBufferData.sceneScale = reciprocal(scene->cameraDistance) / (v2f)windowSize * 2.0f;
-		//scene->constantBufferData.matrixSceneToNDC = m4::scaling(reciprocal(scene->cameraDistance)) * m4::scaling(2.0f / (v2f)windowSize, 1) * m4::translation(-scene->cameraPosition, 0);
-	}
-	if (scene->drawColorDirty) {
-		scene->drawColorDirty = false;
-		scene->constantBufferData.drawColor = scene->drawColor;
-		scene->constantBufferDirty = true;
-	}
-	if (scene->constantBufferDirty) {
-		scene->constantBufferDirty = false;
-		d3d11State.immediateContext->UpdateSubresource(scene->constantBuffer, 0, 0, &scene->constantBufferData, 0, 0);
-	} 
-
-	// clearing canvas instead of back buffer for dropper to work
-	d3d11State.clearRenderTarget(scene->canvasRTMS, canvasColor.data());
-	//d3d11State.clearRenderTarget(scene->canvasRTMS, v4f{1,1,1,0}.data());
-	d3d11State.immediateContext->OMSetRenderTargets(1, &scene->canvasRTMS.rtv, 0);
-	d3d11State.immediateContext->VSSetConstantBuffers(0, 1, &scene->constantBuffer);
-	d3d11State.immediateContext->PSSetConstantBuffers(0, 1, &scene->constantBuffer);
-	
-	d3d11State.immediateContext->OMSetBlendState(0, v4f{}.data(), ~0);
-
-	d3d11State.immediateContext->RSSetState(currentRasterizer);
-	for (u32 i = 0; i < scene->postLastVisibleActionIndex; ++i) {
-		drawAction(scene->actions[i]);
-	}
-	drawAction(currentAction);
-	d3d11State.immediateContext->RSSetState(defaultRasterizer);
-	
-	if (drawCursor) {
-		d3d11State.immediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-
-		d3d11State.immediateContext->VSSetShader(circleShader.vs, 0, 0);
-		d3d11State.immediateContext->PSSetShader(circleShader.ps, 0, 0);
-		d3d11State.immediateContext->Draw(48, 0);
-
-		d3d11State.immediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	auto actionIterator = scene->actions.begin();
+	auto entityIterator = scene->entities.begin();
+	auto getAction = [&]() -> Action & { return *actionIterator++; };
+	auto getEntity = [&](EntityId id) -> Entity & { return scene->entities.at(id); };
+	auto empty = [](auto&){};
+	auto revert = [](u32 amount) {
+		INVALID_CODE_PATH("revert should never be called here");
+	};
+	if (!traverseSceneSaveableData(scene, appender, getAction, getEntity, empty, empty, revert)) {
+		INVALID_CODE_PATH("traverseSceneSaveableData should never fail here");
 	}
 	
-	d3d11State.immediateContext->OMSetRenderTargets(1, &scene->canvasRT.rtv, 0);
-	d3d11State.immediateContext->PSSetShaderResources(0, 1, &scene->canvasRTMS.srv);
-	d3d11State.setVertexShader(blitShaderMS.vs);
-	d3d11State.setPixelShader(blitShaderMS.ps);
-	d3d11State.immediateContext->Draw(3, 0);
-}
-void updatePieBuffer(PieMenu &menu) {
-	if (menu.T) {
-		PieConstantBufferData data;
-		data.piePos = menu.position;
-		data.pieSize = min(windowSize.x, windowSize.y) * pieMenuSize;
-		data.pieAlpha = menu.T * menu.alpha;
-		data.pieAngle = atan2((v2f)mousePosBL - menu.position);
-		d3d11State.immediateContext->UpdateSubresource(menu.constantBuffer, 0, 0, &data, 0, 0);
-	}
-}
-void repaint(bool drawCursor) {
-	if (windowSizeDirty) {
-		windowSizeDirty = false;
-		globalConstantBufferData.matrixWindowToNDC = m4::translation(-1, -1, 0) * m4::scaling(2.0f / (v2f)windowSize, 1);
-		globalConstantBufferData.windowSize = (v2f)windowSize;
-		globalConstantBufferData.windowAspect = (f32)windowSize.x / windowSize.y;
-		d3d11State.immediateContext->UpdateSubresource(globalConstantBuffer, 0, 0, &globalConstantBufferData, 0, 0);
-	}
-
-	setViewport(0, 0, windowSize.x, windowSize.y);
-
-	if (shouldRepaint(currentScene)) {
-		repaintScene(currentScene, drawCursor);
-	}
-	if (playingSceneShiftAnimation) {
-		if (shouldRepaint(previousScene)) {
-			repaintScene(previousScene, drawCursor);
-		}
-	}
+	scene->savedHash = getSceneHash(scene);
 	
-	if (needRepaint) {
-		needRepaint = false;
-		
-		d3d11State.setRenderTarget(d3d11State.backBuffer);
-		d3d11State.setVertexShader(blitShader.vs);
-		d3d11State.setPixelShader(blitShader.ps);
-		
-		if (playingSceneShiftAnimation) {
-			D3D11_VIEWPORT v{};
-			v.Width = windowSize.x;
-			v.Height = windowSize.y;
-			v.MaxDepth = 1.0f;
+	scene->showAsterisk = false;
+	scene->savedPostLastVisibleActionIndex = scene->postLastVisibleActionIndex;
+	scene->modifiedPostLastVisibleActionIndex = scene->postLastVisibleActionIndex;
+	updateWindowText = true;
 
-			if (currentScene > previousScene)
-				v.TopLeftX = lerp(0.0f, -v.Width, sceneShiftT);
-			else
-				v.TopLeftX = lerp(0.0f, v.Width, sceneShiftT);
-
-			d3d11State.immediateContext->RSSetViewports(1, &v);
-			d3d11State.immediateContext->PSSetShaderResources(0, 1, &previousScene->canvasRT.srv);
-			d3d11State.immediateContext->Draw(3, 0);
-			
-			if (currentScene > previousScene)
-				v.TopLeftX = lerp(v.Width, 0.0f, sceneShiftT);
-			else
-				v.TopLeftX = lerp(-v.Width, 0.0f, sceneShiftT);
-			d3d11State.immediateContext->RSSetViewports(1, &v);
-		}
-
-		d3d11State.immediateContext->PSSetShaderResources(0, 1, &currentScene->canvasRT.srv);
-		d3d11State.immediateContext->Draw(3, 0);
-		
-		d3d11State.immediateContext->OMSetBlendState(alphaBlend, v4f{}.data(), ~0);
-
-		auto makeQuad = [](v2f position, v2f size, v2u uv, v4f color) {
-			Quad q;
-			q.position = position;
-			q.position.y -= size.y;
-			q.size = size;
-			q.color = color;
-			setUv(q, uv);
-			return q;
-		};
-		auto pushShadowedQuad = [&](auto &quads, v2f position, v2f size, v2u uv, v4f color) {
-			auto quad = makeQuad(position, size, uv, color);
-			auto shadow = quad;
-			setUv(shadow, {2, 1});
-			shadow.position -= toolImageSize;
-			shadow.size += toolImageSize * 2;
-			shadow.color.w *= 0.5f;
-			quads.push_back(shadow);
-			quads.push_back(quad);
-		};
-		auto drawPieMenu = [&] (PieMenu &menu) {
-			updatePieBuffer(menu);
-			if (menu.T) {
-				StaticList<Quad, 16> quads;
-
-				d3d11State.immediateContext->VSSetConstantBuffers(2, 1, &menu.constantBuffer);
-				d3d11State.immediateContext->VSSetShader(pieSelShader.vs, 0, 0);
-				d3d11State.immediateContext->PSSetShader(pieSelShader.ps, 0, 0);
-
-				d3d11State.immediateContext->Draw(48, 0);
-			
-				f32 extent = min(windowSize.x, windowSize.y) * pieMenuSize;
-
-				for (u32 i = 0; i < menu.items.size(); ++i) {
-					v2f offset = m2::rotation(map(i, 0.0f, menu.items.size(), 0.0f, pi * 2)) * V2f(-extent, 0);
-					auto &item = menu.items[i];
-					pushShadowedQuad(quads, menu.position + offset * menu.T + v2f{-1, 1} * toolImageSize * 0.5f, V2f(toolImageSize), item.uv, V4f(1, 1, 1, menu.T));
-				}
-			
-				d3d11State.immediateContext->VSSetShader(quadShader.vs, 0, 0);
-				d3d11State.immediateContext->PSSetShader(quadShader.ps, 0, 0);
-
-				d3d11State.immediateContext->VSSetShaderResources(0, 1, &uiSBuffer.srv);
-				d3d11State.immediateContext->PSSetShaderResources(0, 1, &toolAtlas.srv);
-
-				d3d11State.updateStructuredBuffer(uiSBuffer, quads.size(), sizeof(Quad), quads.data());
-
-				d3d11State.immediateContext->Draw(quads.size() * 6, 0);
-			}
-		};
-		drawPieMenu(mainPieMenu);
-		drawPieMenu(toolPieMenu);
-		drawPieMenu(canvasPieMenu);
-
-		d3d11State.immediateContext->OMSetBlendState(alphaBlend, v4f{}.data(), ~0);
-		if (drawCursor) {
-
-			Quad cursorQuad = makeQuad((v2f)mousePosBL, V2f(toolImageSize), getUv(currentScene->currentTool), V4f(1));
-			
-			d3d11State.immediateContext->VSSetShader(quadShader.vs, 0, 0);
-			d3d11State.immediateContext->PSSetShader(quadShader.ps, 0, 0);
-
-			d3d11State.immediateContext->VSSetShaderResources(0, 1, &uiSBuffer.srv);
-			d3d11State.immediateContext->PSSetShaderResources(0, 1, &toolAtlas.srv);
-
-			d3d11State.updateStructuredBuffer(uiSBuffer, 1, sizeof(Quad), &cursorQuad);
-
-			d3d11State.immediateContext->Draw(6, 0);
-		}
-
-		if (colorMenuAlpha) {
-
-			colorConstantBufferData.size = min(windowSize.x, windowSize.y) * 0.2f;
-			colorConstantBufferData.position = colorMenuPosition;
-			colorConstantBufferData.alpha = colorMenuAlpha;
-			colorConstantBufferData.hueColor = hsvToRgb(colorMenuHue, 1, 1);
-			d3d11State.immediateContext->UpdateSubresource(colorConstantBuffer, 0, 0, &colorConstantBufferData, 0, 0);
-
-			d3d11State.immediateContext->VSSetShader(colorMenuShader.vs, 0, 0);
-			d3d11State.immediateContext->PSSetShader(colorMenuShader.ps, 0, 0);
-			d3d11State.immediateContext->Draw(12, 0);
-		}
-
-		d3d11State.swapChain->Present(1, 0);
-	} else {
-		Sleep(16);
-	}
+	return builder;
 }
 
-void showCursor() { while (ShowCursor(1) < 0); }
-void hideCursor() { while (ShowCursor(0) >= 0); }
-
-template <class T>
-void writeValue(HANDLE file, T const &value) {
-	DWORD bytesWritten;
-	if (!WriteFile(file, &value, sizeof(value), &bytesWritten, 0) || bytesWritten != sizeof(value))
-		INVALID_CODE_PATH("WriteFile failed");
-}
-bool readValue(Span<u8 const> &data, void *dst, umm dstSize) {
-	if (dstSize > data.size())
-		return false;
-	memcpy(dst, data.begin(), dstSize);
-	data._begin += dstSize;
-	return true;
-}
-template <class T>
-bool readValue(Span<u8 const> &data, T &value) {
-	return readValue(data, &value, sizeof(value));
-}
-
-void writeScene(HANDLE file, Scene *scene) {
-	writeValue(file, scene->cameraDistance);
-	writeValue(file, scene->cameraPosition);
-	writeValue(file, scene->currentTool);
-	writeValue(file, scene->drawColor);
-	writeValue(file, scene->drawThickness);
-	writeValue(file, scene->postLastVisibleActionIndex);
-	for (auto &action : scene->actions) {
-		switch (action.type) {
-			case ActionType_none: INVALID_CODE_PATH("scene->actions should not contain ActionType_none"); break;
-			case ActionType_pencil: {
-				writeValue(file, 'P');
-				auto count = action.pencil.lines.size();
-				writeValue(file, count);
-				DWORD bytesWritten;
-				WriteFile(file, action.pencil.lines.data(), count * sizeof(Line), &bytesWritten, 0);
-			} break;
-			case ActionType_line: {
-				writeValue(file, 'L');
-				writeValue(file, action.line.line);
-			} break;
-			case ActionType_grid: {
-				writeValue(file, 'G');
-				writeValue(file, action.grid.startPoint);
-				writeValue(file, action.grid.endPosition);
-				writeValue(file, action.grid.cellCount);
-			} break;
-		}
-	}
-	scene->savedHash = getHash(scene);
-}
-
-wchar *getFilename(std::wstring &path) {
-	return path.data() + path.rfind(L'\\') + 1;
-}
-
-void saveScene(Scene *scene, wchar const *path) {
-	LOGW(L"saving scene: '%s'", path);
-	HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, 0, 0);
-	if (file == INVALID_HANDLE_VALUE) {
-		showConsoleWindow();
-		LOGW(L"failed to open file for writing: %s", path);
-	} else {
-		scene->path = path;
-		scene->filename = getFilename(scene->path);
-		writeScene(file, scene);
-		CloseHandle(file);
-	}
-}
-void saveSceneAs(Scene *scene) {
-	showCursor();
-	wchar buf[1024];
-	buf[0] = 0;
-	OPENFILENAMEW f{};
-	f.lStructSize = sizeof(f);
-	f.hwndOwner = mainWindow;
-	f.lpstrFilter = localizations[language].fileFilter;
-	f.lpstrFile = buf;
-	f.nMaxFile = 1024;
-	f.lpstrTitle = localizations[language].saveFileTitle;
-	f.lpstrDefExt = L".drawt";
-	if (GetSaveFileNameW(&f)) {
-		saveScene(scene, f.lpstrFile);
-		updateWindowText = true;
-	} else {
-		auto err = CommDlgExtendedError();
-		LOG("GetSaveFileNameW failed; CommDlgExtendedError: %u", err);
-	}
-	hideCursor();
-}
 void saveScene(Scene *scene) {
 	if (scene->path.size()) {
-		saveScene(scene, scene->path.c_str());
+		platform_saveScene(scene, scene->path.c_str());
 	} else {
-		saveSceneAs(scene);
+		saveSceneDialog(scene);
 	}
 }
 
-bool readAction(Span<u8 const> &data, Action &result) {
-	DWORD bytesRead;
-	char actionType;
-	if (!readValue(data, actionType))
-		return false;
-	switch (actionType) {
-		case 'P': {
-			PencilAction pencil;
-			umm count;
-			if (!readValue(data, count))
-				return false;
-			pencil.lines.resize(count);
-			if (!readValue(data, pencil.lines.data(), count * sizeof(Line)))
-				return false;
-			pencil.transformedLines.reserve(count);
-			for (auto line : pencil.lines) {
-				pencil.transformedLines.push_back(transform(line));
-			}
-			pencil.lineBuffer = d3d11State.createStructuredBuffer(pencil.transformedLines.size(), sizeof(TransformedLine), pencil.transformedLines.data(), D3D11_USAGE_IMMUTABLE);
-			result = std::move(pencil);
-		} break;
-		case 'L': {
-			LineAction line;
-			if (!readValue(data, line.line))
-				return false;
-			TransformedLine transformedLine = transform(line.line);
-			line.buffer = d3d11State.createStructuredBuffer(1, sizeof(TransformedLine), &transformedLine, D3D11_USAGE_DYNAMIC);
-			result = std::move(line);
-		} break;
-		default: {
-			LOG("action data corrupted");
+bool readScene(Span<u8 const> data, Scene *dstScene) {
+	Scene tempScene;
+	auto reader = [&] (void *dst, umm size, char const *name) {
+		if (size > data.size()) {
+			LOG("Failed to read %", name);
 			return false;
-		} break;
+		}
+		memcpy(dst, data.begin(), size);
+		data._begin += size;
+		return true;
+	};
+	auto getAction = [] { return Action{}; };
+	auto getEntity = [] (EntityId id) { 
+		return Entity(CreateEntity_zeroMemory, id);
+	};
+	auto onActionAdded = [&](Action &a){ tempScene.actions.push_back(std::move(a)); };
+	auto onEntityAdded = [&](Entity &e){
+		calculateBounds(e);
+		tempScene.entities.emplace(e.id, std::move(e));
+	};
+	auto revert = [&](u32 amount) {
+		data._begin -= amount;
+	};
+	if (!traverseSceneSaveableData(&tempScene, reader, getAction, getEntity, onActionAdded, onEntityAdded, revert)) {
+		return false;
 	}
+	
+	for (auto &[id, e] : dstScene->entities) {
+		cleanup(e);
+	}
+	auto renderData = dstScene->renderData;
+	*dstScene = std::move(tempScene);
+	dstScene->renderData = renderData;
+	dstScene->initialized = true;
+	dstScene->savedHash = getSceneHash(dstScene);
+	dstScene->savedPostLastVisibleActionIndex = dstScene->postLastVisibleActionIndex;
+	dstScene->modifiedPostLastVisibleActionIndex = dstScene->postLastVisibleActionIndex;
+	dstScene->showAsterisk = false;
+	dstScene->needRepaint = true;
 	return true;
 }
-bool readScene(Span<u8 const> data, Scene *scene) {
-	Scene prevScene = std::move(*scene);
-	if (!readValue(data, scene->cameraDistance)) return false;
-	if (!readValue(data, scene->cameraPosition)) return false;
-	if (!readValue(data, scene->currentTool)) return false;
-	if (!readValue(data, scene->drawColor)) return false;
-	if (!readValue(data, scene->drawThickness)) return false;
-	if (!readValue(data, scene->postLastVisibleActionIndex)) return false;
+bool app_loadScene(Scene *scene, wchar const *path) {
+	auto file = readEntireFile(path);
+	if (!file) {
+		LOGW(L"Failed to open '%'", path);
+		return false;
+	}
+	DEFER { free(file); };
 
+	if (readScene({(u8 *)file.begin(), (u8 *)file.end()}, scene)) {
+		scene->path = path;
+		scene->filename = getFilename(scene->path);
+		return true;
+	} else {
+		LOGW(L"Failed to load scene '%'", path);
+		return false;
+	}
+
+}
+void generateGfxData(Scene *scene) {
+	scene->needRepaint = true;
 	scene->constantBufferDirty = true;
 	scene->drawColorDirty = true;
 	scene->matrixSceneToNDCDirty = true;
-	scene->constantBufferData.drawThickness = getDrawThickness(scene);
+	scene->targetCameraDistance = scene->cameraDistance;
+	scene->targetCameraPosition = scene->cameraPosition;
+	renderer->update(scene);
 
-	for (;;) {
-		if (!data.size()) {
-			break;
+	colorMenuHue = rgbToHsv(scene->drawColor).x;
+
+	for (auto &[id, e] : scene->entities) {
+		renderer->initEntity(e);
+		switch (e.type) {
+			case Entity_pencil:
+			case Entity_line:  
+			case Entity_grid:  
+			case Entity_circle:
+				break;
+			case Entity_image: {
+				auto& image = e.image;
+				image.renderData = getOrLoadImageData(image.path);
+			} break;
 		}
-		Action action;
-		if (readAction(data, action)) {
-			scene->actions.push_back(std::move(action));
-		}
-		else {
-			*scene = std::move(prevScene);
-			return false;
-		}
+		renderer->initEntityData(scene, e);
 	}
-	needRepaint = true;
-	scene->savedHash = getHash(scene);
-	return true;
-}
-bool loadScene(Scene *scene, HANDLE file) {
-	LARGE_INTEGER endPointer;
-	SetFilePointerEx(file, {}, &endPointer, FILE_END);
-	SetFilePointerEx(file, {}, 0, FILE_BEGIN);
-	auto data = malloc(endPointer.QuadPart);
-	DEFER { free(data); };
-	DWORD bytesRead;
-	if (!ReadFile(file, data, endPointer.QuadPart, &bytesRead, 0) || bytesRead != endPointer.QuadPart) {
-		LOG("ReadFile failed");
-		return false;
-	}
-	return readScene({(u8 *)data, (u8 *)data + endPointer.QuadPart}, scene);
-}
-bool loadScene(Scene *scene, wchar const *path) {
-	HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
-	if (file == INVALID_HANDLE_VALUE) {
-		LOGW(L"Failed to open file: %s", path);
-		return false;
-	} else {
-		DEFER { CloseHandle(file); };
-		if (loadScene(scene, file)) {
-			scene->path = path;
-			scene->filename = getFilename(scene->path);
-			return true;
-		} else {
-			LOGW(L"Failed to load scene from: %s", path);
-			return false;
-		}
-	}
-}
-bool openScene(Scene *scene) {
-	wchar buf[1024];
-	buf[0] = 0;
-	OPENFILENAMEW f{};
-	f.lStructSize = sizeof(f);
-	f.hwndOwner = mainWindow;
-	f.lpstrFilter = localizations[language].fileFilter;
-	f.lpstrFile = buf;
-	f.nMaxFile = 1024;
-	f.lpstrTitle = localizations[language].openFileTitle;
-	f.lpstrDefExt = L".drawt";
-	if (GetOpenFileNameW(&f)) {
-		return loadScene(scene, f.lpstrFile);
-	} else {
-		auto err = CommDlgExtendedError();
-		LOG("GetOpenFileNameW failed; CommDlgExtendedError: %u", err);
-	}
-	return false;
 }
 
-bool isUnsaved(Scene const *scene) {
+void loadSceneStressTest() {
+	if (openSceneDialog(currentScene)) {
+		generateGfxData(currentScene);
+		showConsoleWindow();
+		for (u32 i = 0; i < 1024; ++i) {
+			u32 s = 0, l = 0, g = 0;
+			{
+				auto begin = std::chrono::high_resolution_clock::now();
+				platform_saveScene(currentScene, currentScene->path.data());
+				s = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - begin).count();
+			}
+			{
+				auto begin = std::chrono::high_resolution_clock::now();
+				if (!app_loadScene(currentScene, currentScene->path.data()))
+					break;
+				l = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - begin).count();
+			}
+			{
+				auto begin = std::chrono::high_resolution_clock::now();
+				generateGfxData(currentScene);
+				g = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now() - begin).count();
+			}
+			LOG("s = %; l = %; g = %", s, l, g);
+		}
+	}
+}
+
+bool isUnsaved(Scene *scene) {
 	if (scene->initialized) {
-		if (scene->savedHash != getHash(scene)) {
+		if (scene->savedHash != getSceneHash(scene)) {
 			return true;
 		} else if (scene->path.size()) {
 			Scene savedScene;
-			if (!loadScene(&savedScene, scene->path.c_str())) {
+			if (!app_loadScene(&savedScene, scene->path.c_str())) {
+				return true;
+			}
+			if (scene->savedHash != savedScene.savedHash) {
 				return true;
 			}
 			if (!equals(scene, &savedScene)) {
@@ -1588,14 +895,14 @@ bool isUnsaved(Scene const *scene) {
 	}
 	return false;
 }
-bool tryExitApp() {
+bool app_tryExit() {
 	showCursor();
 	for (auto &scene : scenes) {
 		if (isUnsaved(&scene)) {
 			currentScene = &scene;
 			needRepaint = true;
-			repaint(false);
-			if (MessageBoxW(mainWindow, localizations[language].unsavedScenes, localizations[language].warning, MB_OKCANCEL | MB_ICONWARNING) == IDOK) {
+			renderer->repaint(false, false);
+			if (platform_messageBox(localizations[language].unsavedScenes, localizations[language].warning, MessageBoxType::warning)) {
 				running = false;
 				return true;
 			} else {
@@ -1606,301 +913,847 @@ bool tryExitApp() {
 	running = false;
 	return true;
 }
-void exitAppAbnormal() {
+void app_exitAbnormal() {
+	bool unsavedScenes[countof(scenes)];
 	bool hasUnsavedScenes = false;
 	for (u32 i = 0; i < countof(scenes); ++i) {
-		Scene *scene = scenes + i;
-		if (isUnsaved(scene)) {
+		if (isUnsaved(scenes + i)) {
 			hasUnsavedScenes = true;
-			break;
+			unsavedScenes[i] = true;
+		} else {
+			unsavedScenes[i] = false;
 		}
 	}
 	if (hasUnsavedScenes) {
-		SYSTEMTIME time = {};
-		GetLocalTime(&time);
-		std::wstring year   = std::to_wstring(time.wYear);
-		std::wstring month  = std::to_wstring(time.wMonth);  if ( month.size() == 1)  month.insert( month.begin(), '0');
-		std::wstring day    = std::to_wstring(time.wDay);    if (   day.size() == 1)    day.insert(   day.begin(), '0');
-		std::wstring hour   = std::to_wstring(time.wHour);   if (  hour.size() == 1)   hour.insert(  hour.begin(), '0');
-		std::wstring minute = std::to_wstring(time.wMinute); if (minute.size() == 1) minute.insert(minute.begin(), '0');
-		std::wstring second = std::to_wstring(time.wSecond); if (second.size() == 1) second.insert(second.begin(), '0');
-
-		std::wstring savePath = executableDirectory;
-		savePath.reserve(256);
-		savePath += L"saves\\";
-		CreateDirectoryW(savePath.data(), 0);
-		savePath += year;   savePath.push_back(L'_');
-		savePath += month;  savePath.push_back(L'_');
-		savePath += day;    savePath.push_back(L'_');
-		savePath += hour;   savePath.push_back(L'_');
-		savePath += minute; savePath.push_back(L'_');
-		savePath += second; savePath.push_back(L'\\');
-		CreateDirectoryW(savePath.data(), 0);
-		u32 savePathSize = savePath.size();
-		for (u32 i = 0; i < countof(scenes); ++i) {
-			Scene *scene = scenes + i;
-			if (isUnsaved(scene)) {
-				savePath.resize(savePathSize);
-				savePath += std::to_wstring(i);
-				savePath += L".drawt";
-				saveScene(scene, savePath.data());
-			}
-		}
+		platform_emergencySave(unsavedScenes);
 	}
 	running = false;
-}
-
-void initD3D11() {
-	TIMED_FUNCTION;
-	{TIMED_BLOCK("D3D11::createState");
-		UINT deviceFlags = 0;
-#if BUILD_DEBUG
-		deviceFlags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
-		d3d11State = D3D11::createState(mainWindow, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, 1, true, 1, deviceFlags);
-	}
-	msaaSampleCount = d3d11State.getMaxMsaaSampleCount(DXGI_FORMAT_R8G8B8A8_UNORM);
-	WorkQueue d3d11Queue = makeWorkQueue(&threadPool);
-
-	d3d11State.immediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	
-	D3D11_BUFFER_DESC d{};
-	d.Usage = D3D11_USAGE_DEFAULT;
-	d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	d.ByteWidth = sizeof(globalConstantBufferData);
-	DHR(d3d11State.device->CreateBuffer(&d, 0, &globalConstantBuffer));
-	d3d11State.immediateContext->VSSetConstantBuffers(1, 1, &globalConstantBuffer);
-	d3d11State.immediateContext->PSSetConstantBuffers(1, 1, &globalConstantBuffer);
-	
-	d.ByteWidth = sizeof(ActionConstantBufferData);
-	DHR(d3d11State.device->CreateBuffer(&d, 0, &actionConstantBuffer));
-	d3d11State.immediateContext->VSSetConstantBuffers(4, 1, &actionConstantBuffer);
-	d3d11State.immediateContext->PSSetConstantBuffers(4, 1, &actionConstantBuffer);
-
-	d.ByteWidth = sizeof(colorConstantBufferData);
-	DHR(d3d11State.device->CreateBuffer(&d, 0, &colorConstantBuffer));
-	d3d11State.immediateContext->VSSetConstantBuffers(3, 1, &colorConstantBuffer);
-	d3d11State.immediateContext->PSSetConstantBuffers(3, 1, &colorConstantBuffer);
-
-	d.ByteWidth = sizeof(PieConstantBufferData);
-	DHR(d3d11State.device->CreateBuffer(&d, 0, &mainPieMenu.constantBuffer));
-	DHR(d3d11State.device->CreateBuffer(&d, 0, &toolPieMenu.constantBuffer));
-	DHR(d3d11State.device->CreateBuffer(&d, 0, &canvasPieMenu.constantBuffer));
-
-	d3d11Queue.push([&] { initLineShader();   });
-	d3d11Queue.push([&] { initUIQuadShader(); });
-	d3d11Queue.push([&] { initBlitShader();   });
-	d3d11Queue.push([&] { initBlitShaderMS();   });
-	d3d11Queue.push([&] { initCircleShader(); });
-	d3d11Queue.push([&] { initPieSelShader(); });
-	d3d11Queue.push([&] { initColorMenuShader(); });
-
-	d3d11Queue.push([&] {
-		TIMED_BLOCK("Init samplers");
-		D3D11_SAMPLER_DESC d{};
-		d.AddressU = d.AddressV = d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-		d.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-		d.MaxLOD = FLT_MAX;
-		ID3D11SamplerState *samplerState;
-		DHR(d3d11State.device->CreateSamplerState(&d, &samplerState));
-		d3d11State.immediateContext->PSSetSamplers(0, 1, &samplerState);
-	});
-
-	d3d11Queue.push([&] {
-		TIMED_BLOCK("Init blend");
-		D3D11_BLEND_DESC d{};
-		d.RenderTarget[0].BlendEnable = true;
-		d.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-		d.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
-		d.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
-		d.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_MAX;
-		d.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-		d.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
-		d.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-		DHR(d3d11State.device->CreateBlendState(&d, &alphaBlend));
-	});
-	
-	{
-		static constexpr u32 atlasData[] {
-#include "atlas.h"
-		};
-		static_assert(countof(atlasData) == 128*128);
-		d3d11Queue.push([&] {
-			TIMED_BLOCK("toolAtlas");
-			toolAtlas = d3d11State.createTexture(128, 128, DXGI_FORMAT_R8G8B8A8_UNORM, atlasData);
-		});
-	}
-
-	uiSBuffer = d3d11State.createStructuredBuffer(16, sizeof(Quad), 0, D3D11_USAGE_DYNAMIC);
-	
-	d3d11Queue.push([&] {
-		TIMED_BLOCK("CreateRasterizerState");
-		D3D11_RASTERIZER_DESC d = {};
-		d.AntialiasedLineEnable = true;
-		d.CullMode = D3D11_CULL_BACK;
-		d.FillMode = D3D11_FILL_SOLID;
-		d.MultisampleEnable = true;
-		DHR(d3d11State.device->CreateRasterizerState(&d, &defaultRasterizer));
-		d.FillMode = D3D11_FILL_WIREFRAME;
-		DHR(d3d11State.device->CreateRasterizerState(&d, &wireframeRasterizer));
-
-		currentRasterizer = defaultRasterizer;
-	});
-	
-	d3d11Queue.completeAllWork();
 }
 
 void openPieMenu(PieMenu &menu) {
 	menu.opened = true;
 	menu.position = (v2f)mousePosBL;
-	menu.T = 0.0f;
-	menu.alpha = 0.0f;
+	menu.animTime = 0.0f;
+	menu.handAlphaTime = 0.0f;
+	menu.rightMouseReleased = false;
+	currentScene->needRepaint = true;
 }
+void closePieMenu(PieMenu &menu) {
+	menu.opened = false;
+	currentScene->needRepaint = true;
+	cursorVisible = false;
+};
 void openColorMenu(ColorMenuTarget target) {
 	colorMenuOpened = true;
-	colorMenuPosition = (v2f)mousePosBL;
+	colorMenuPositionTL = (v2f)mousePosTL;
 	colorMenuTarget = target;
+	renderer->onColorMenuOpen(target);
 };
 
-void start(HINSTANCE instance, LPWSTR args) {
-	TIMED_FUNCTION;
-	initGlobals(instance);
+void pushPieMenuItem(PieMenu &menu, v2u uv, PieMenuItemType type, void (*onSelect)()) {
+	PieMenuItem item;
+	item.uv = uv;
+	item.type = type;
+	item.onSelect = onSelect;
+	menu.items.push_back(item);
+}
 
-	WorkQueue startQueue = makeWorkQueue(&threadPool);
+void start(Span<wchar *> args) {
+	initGlobals();
 
-	startQueue.push([] {
-		initLocalization();
-	});
+	initLocalization();
 
-	LOGW("args: %s", args);
+	for (u32 i = 0; i < args.size(); ++i) {
+		LOGW(L"arg[%]: %", i, args[i]);
+	}
 
-	WNDCLASSEXA wc{};
-	wc.cbSize = sizeof wc;
-	wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
-		switch (msg) {
-			case WM_GETMINMAXINFO: {
-				MINMAXINFO *mmi = (MINMAXINFO *)lp;
-				mmi->ptMinTrackSize.x = 256;
-				mmi->ptMinTrackSize.y = 128;
-			} return 0;
-			case WM_DESTROY:
-			case WM_CLOSE: {
-				tryExitApp();
-			} return 0;
-			case WM_SIZE: {
-				v2u newSize;
-				newSize.x = GET_X_LPARAM(lp);
-				newSize.y = GET_Y_LPARAM(lp);
-				if (newSize.x == 0 || newSize.y == 0)
-					return 0;
-				windowSize = newSize;
-				windowResized = true;
-				if (d3d11State.swapChain) {
-					resizeRenderTargets();
-					currentScene->matrixSceneToNDCDirty = true;
-					windowSizeDirty = true;
-					repaint(false);
+	createWindow();
+	
+	renderer = createRenderer();
+	
+	imageLoaderThread = std::thread([&]{
+		while (running) {
+			loopUntil([&] {
+				lock(loadedImagesMutex);
+				if (imagesToLoad.size()) {
+					LoadedImage *image = imagesToLoad.front();
+					imagesToLoad.pop();
+					unlock(loadedImagesMutex);
+
+					auto imageBuffer = readEntireFile(image->path.data());
+
+					if (imageBuffer) {
+						DEFER { free(imageBuffer); };
+
+						int width, height;
+						stbi_uc *pixels = 0;
+
+						pixels = stbi_load_from_memory((stbi_uc *)imageBuffer.data(), imageBuffer.size(), &width, &height, 0, 4);
+						
+						if (pixels) {
+							DEFER { stbi_image_free(pixels); };
+							renderer->setTexture(image->renderData, pixels, width, height);
+							currentScene->needRepaint = true;
+						} else {							
+							LOGW(L"%: stbi_load_from_memory failed: %", image->path.data(), stbi_failure_reason());
+						}
+					} else {
+						LOGW(L"readEntireFile failed: %", image->path.data());
+					}
+					return true;
+				} else {
+					unlock(loadedImagesMutex);
 				}
-			} return 0;
-			case WM_MOVE: {
-				windowPos.x = GET_X_LPARAM(lp);
-				windowPos.y = GET_Y_LPARAM(lp);
-			} return 0;
-			case WM_KILLFOCUS: {
-				lostFocus = true;
-			} return 0;
-			case WM_EXITSIZEMOVE: {
-				exitSizeMove = true;
-			} return 0;
+				return !running;
+			});
 		}
-		return DefWindowProc(hwnd, msg, wp, lp);
-	};
-	wc.hInstance = instance;
-	wc.hCursor = LoadCursorA(0, IDC_ARROW);
-	wc.lpszClassName = "drawt_main";
-	if (!RegisterClassExA(&wc)) {
-		LOG("RegisterClassExA failed");
-		exit(-1);
-	}
-
-	DWORD windowStyle = WS_OVERLAPPEDWINDOW | WS_MAXIMIZE;
-	mainWindow = CreateWindowExA(0, wc.lpszClassName, "Drawt", windowStyle, 0, 0, 1600, 900, NULL, NULL, instance, NULL);
-	if (!mainWindow) {
-		LOG("CreateWindowExA failed");
-		exit(-1);
-	}
-	
-	DHR(OleInitialize(0));
-	DHR(RegisterDragDrop(mainWindow, &dropTarget));
-	
-	initD3D11();
-	
-	startQueue.completeAllWork();
+	});
 
 	initializeScene(currentScene);
 	
-	std::wstring initialScenePath = args;
-	if (initialScenePath.size() && initialScenePath.back() == L'"')
-		initialScenePath.pop_back();
-	if (initialScenePath.size() && initialScenePath.front() == L'"')
-		initialScenePath.erase(initialScenePath.begin());
+	if (args.size() > 1) {
+		std::wstring initialScenePath = args[1];
+		if (initialScenePath.size() && initialScenePath.back() == L'"')
+			initialScenePath.pop_back();
+		if (initialScenePath.size() && initialScenePath.front() == L'"')
+			initialScenePath.erase(initialScenePath.begin());
 
-	if (initialScenePath.size()) {
-		loadScene(currentScene, initialScenePath.c_str());
-		targetCameraDistance = currentScene->cameraDistance;
+		if (initialScenePath.size()) {
+			app_loadScene(currentScene, initialScenePath.c_str());
+			generateGfxData(currentScene);
+		}
 	}
 	
-	PieMenuItem item;
-	
-	item.uv = {2,0};
-	item.onSelect = [] { openPieMenu(toolPieMenu); };
-	mainPieMenu.items.push_back(item);
-	
-	item.uv = {3,1};
-	item.onSelect = [] { openPieMenu(canvasPieMenu); };
-	mainPieMenu.items.push_back(item);
-	
+	pushPieMenuItem(mainPieMenu, getUv(Tool_pencil), 0, [] { currentScene->tool = Tool_pencil; });
+	pushPieMenuItem(mainPieMenu, getUv(Tool_line), 0, [] { currentScene->tool = Tool_line; });
+	pushPieMenuItem(mainPieMenu, getUv(Tool_circle), 0, [] { currentScene->tool = Tool_circle; });
+	pushPieMenuItem(mainPieMenu, getUv(Tool_grid), 0, [] { currentScene->tool = Tool_grid; });
+	pushPieMenuItem(mainPieMenu, getUv(Tool_dropper), 0, [] { currentScene->tool = Tool_dropper; });
+	pushPieMenuItem(mainPieMenu, getUv(Tool_hand), 0, [] { currentScene->tool = Tool_hand; });
+	pushPieMenuItem(mainPieMenu, {3,0}, PieMenuItem_toolColor, [] { openColorMenu(ColorMenuTarget_draw); });
+	pushPieMenuItem(mainPieMenu, {3,0}, PieMenuItem_canvasColor, [] { openColorMenu(ColorMenuTarget_canvas); });
+}
+void updateAsterisk(Scene *scene) {
+	if (scene->savedPostLastVisibleActionIndex <= scene->modifiedPostLastVisibleActionIndex) {
+		scene->showAsterisk = scene->postLastVisibleActionIndex != scene->savedPostLastVisibleActionIndex;
+		updateWindowText = true;
+	}
+}
+void undo() {
+	if (!currentScene->postLastVisibleActionIndex)
+		return;
 
-	item.uv = {0,1};
-	item.onSelect = [] { currentScene->currentTool = Tool_pencil; };
-	toolPieMenu.items.push_back(item);
+	currentScene->postLastVisibleActionIndex--;
+	currentScene->needRepaint = true;
 
-	item.uv = {1,1};
-	item.onSelect = [] { currentScene->currentTool = Tool_line; };
-	toolPieMenu.items.push_back(item);
-
-	item.uv = {0,0};
-	item.onSelect = [] { currentScene->currentTool = Tool_grid; };
-	toolPieMenu.items.push_back(item);
-
-	item.uv = {1,0};
-	item.onSelect = [] { currentScene->currentTool = Tool_dropper; };
-	toolPieMenu.items.push_back(item);
+	auto &action = currentScene->actions[currentScene->postLastVisibleActionIndex];
+	switch (action.type) {
+		case Action_create: {
+			auto &create = action.create;
+			auto target = getEntityById(currentScene, create.targetId);
+			ASSERT(target, "bad create.targetId");
+			target->visible = false;
+			--currentScene->entityIdCounter;
+		} break;
+		case Action_translate: {
+			auto &translate = action.translate;
+			auto target = getEntityById(currentScene, translate.targetId);
+			ASSERT(target, "bad translate.targetId");
+			target->position = translate.startPosition;
+			calculateBounds(*target);
+		} break;
+		case Action_rotate: {
+			auto &rotate = action.rotate;
+			auto target = getEntityById(currentScene, rotate.targetId);
+			ASSERT(target, "bad rotate.targetId");
+			target->rotation = rotate.startAngle;
+			calculateBounds(*target);
+		} break;
+		case Action_scale: {
+			auto &scale = action.scale;
+			auto target = getEntityById(currentScene, scale.targetId);
+			ASSERT(target, "bad scale.targetId");
+			ASSERT(target->type == Entity_image, "scale.targetId can only refer to image");
+			target->position   = scale.startPosition;
+			target->image.size = scale.startSize;
+			calculateBounds(*target);
+		} break;
+	}
+	updateAsterisk(currentScene);
+}
+void redo() {
+	if (currentScene->postLastVisibleActionIndex >= currentScene->actions.size())
+		return;
 	
-	item.uv = {3,0};
-	item.onSelect = [] { openColorMenu(ColorMenuTarget_draw); };
-	toolPieMenu.items.push_back(item);
-	
-	
-	item.uv = {3,0};
-	item.onSelect = [] { openColorMenu(ColorMenuTarget_canvas); };
-	canvasPieMenu.items.push_back(item);
-	
+	currentScene->postLastVisibleActionIndex++;
+	currentScene->needRepaint = true;
 
-	ShowWindow(mainWindow, SW_SHOW);
+	auto &action = currentScene->actions[currentScene->postLastVisibleActionIndex - 1];
 
-	running = true;
+	switch (action.type) {
+		case Action_create: {
+			auto &create = action.create;
+			auto target = getEntityById(currentScene, create.targetId);
+			ASSERT(target, "bad create.targetId");
+			target->visible = true;
+			++currentScene->entityIdCounter;
+		} break;
+		case Action_translate: {
+			auto &translate = action.translate;
+			auto target = getEntityById(currentScene, translate.targetId);
+			ASSERT(target, "bad translate.targetId");
+			target->position = translate.endPosition;
+			calculateBounds(*target);
+		} break;
+		case Action_rotate: {
+			auto &rotate = action.rotate;
+			auto target = getEntityById(currentScene, rotate.targetId);
+			ASSERT(target, "bad rotate.targetId");
+			target->rotation = rotate.endAngle;
+			calculateBounds(*target);
+		} break;
+		case Action_scale: {
+			auto &scale = action.scale;
+			auto target = getEntityById(currentScene, scale.targetId);
+			ASSERT(target, "bad scale.targetId");
+			ASSERT(target->type == Entity_image, "scale.targetId can only refer to image");
+			target->position   = scale.endPosition;
+			target->image.size = scale.endSize;
+			calculateBounds(*target);
+		} break;
+	}
+	updateAsterisk(currentScene);
 }
 
-void setCursorPos(v2s p) {
-	SetCursorPos(p.x, p.y);
+void calculateBounds(EntityBase &e) {
+	e.bounds.min = V2f(+INFINITY);
+	e.bounds.max = V2f(-INFINITY);
+	
+	auto upd = [&] (v2f p) {
+		e.bounds.min = min(e.bounds.min, p);
+		e.bounds.max = max(e.bounds.max, p);
+	};
+
+	auto updr = [&] (v2f p, f32 r) {
+		e.bounds.min = min(e.bounds.min, p - r);
+		e.bounds.max = max(e.bounds.max, p + r);
+	};
+
+	m2 rotation = m2::rotation(-e.rotation);
+	switch (e.type)
+	{
+		case Entity_pencil: {
+			auto &pencil = *(PencilEntity*)&e;
+			for (auto &l : pencil.lines) {
+				updr(rotation * l.a.position, l.a.thickness * 0.5f);
+				updr(rotation * l.b.position, l.b.thickness * 0.5f);
+			}
+			e.bounds.min += pencil.position;
+			e.bounds.max += pencil.position;
+		} break;
+		case Entity_line: {
+			auto &line = *(LineEntity*)&e;
+			updr(line.position + rotation * line.line.a.position, line.line.a.thickness * 0.5f);
+			updr(line.position + rotation * line.line.b.position, line.line.b.thickness * 0.5f);
+		} break;
+		case Entity_grid: {
+			auto &grid = *(GridEntity*)&e;
+			minmax(grid.position, grid.position + rotation * grid.size, e.bounds.min, e.bounds.max);
+			e.bounds.min -= grid.thickness * 0.5f;
+			e.bounds.max += grid.thickness * 0.5f;
+		} break;
+		case Entity_circle: {
+			// This calculation considers only corner points.
+			// Is is not accurate, but it is a lot faster and
+			// works not so bad
+			auto &circle = *(CircleEntity*)&e;
+			v2f corners[4] {
+				{+circle.radius.x,+circle.radius.y},
+				{+circle.radius.x,-circle.radius.y},
+				{-circle.radius.x,+circle.radius.y},
+				{-circle.radius.x,-circle.radius.y},
+			};
+			for (auto c : corners) {
+				upd(rotation * c);
+			}
+			e.bounds.min += circle.position;
+			e.bounds.max += circle.position;
+			e.bounds.min -= circle.thickness * 0.5f;
+			e.bounds.max += circle.thickness * 0.5f;
+		} break;
+		case Entity_image: {
+			auto &image = *(ImageEntity*)&e;
+			v2f halfSize = image.size * 0.5f;
+			v2f corners[4] {
+				{+halfSize.x,+halfSize.y},
+				{+halfSize.x,-halfSize.y},
+				{-halfSize.x,+halfSize.y},
+				{-halfSize.x,-halfSize.y},
+			};
+			for (auto c : corners) {
+				upd(rotation * c);
+			}
+			e.bounds.min += image.position;
+			e.bounds.max += image.position;
+		} break;
+		default:
+			INVALID_CODE_PATH();
+			break;
+	}
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int) {
-	timeBeginPeriod(1);
-	DEFER { timeEndPeriod(1); };
+void findHoveredEntity() {
+	if (!hoveredEntity) {
+		List<Entity *> candidates;
+		for (auto &[id, e] : currentScene->entities) {
+			if (e.visible && inBounds(mouseScenePos, e.bounds)) {
+				candidates.push_back(&e);
+			}
+		}
+		std::sort(candidates.begin(), candidates.end(), [&](Entity *a, Entity *b) {
+			return a->id > b->id;
+		});
+		for (auto ptr : candidates) {
+			auto &e = *ptr;
+			auto mouseRelativePos = m2::rotation(e.rotation) * (mouseScenePos - e.position) + e.position;
+			auto hovering = [&](Line l, v2f offset) {
+				auto a = l.a.position + offset;
+				auto b = l.b.position + offset;
+				auto p = mouseRelativePos;
+				f32 t = dot(normalize(a - b), a - p) / length(a - b);
 
-	start(instance, args);
+				if (t > 1) {
+					return distance(p, b) < l.b.thickness * 0.5f;
+				} else if (t < 0) {
+					return distance(p, a) < l.a.thickness * 0.5f;
+				} else {
+					v2f c = cross(normalize(a - b));
+					f32 d = absolute(dot(c, a - p));
+					return d < lerp(l.a.thickness, l.b.thickness, clamp(t, 0, 1)) * 0.5f;
+				}
+			};
+
+			switch (e.type) {
+				case Entity_image: {
+					ImageEntity &image = e.image;
+					auto uv = map(mouseRelativePos, image.position - image.size * 0.5f, image.position + image.size * 0.5f, 0, 1);
+					if (inBounds(uv, aabbMinMax(V2f(0), V2f(1)))) {
+						hoveredImageUv = uv;
+						hoveredEntity = &e;
+						return;
+					}
+				} break;
+				case Entity_pencil: {
+					PencilEntity &pencil = e.pencil;
+					for (auto l : pencil.lines) {
+						if (hovering(l, pencil.position)) {
+							hoveredEntity = &e;
+							return;
+						}
+					}
+				} break;
+				case Entity_line: {
+					LineEntity &line = e.line;
+					if (hovering(line.line, line.position)) {
+						hoveredEntity = &e;
+						return;
+					}
+				} break;
+				case Entity_grid: {
+					GridEntity &grid = e.grid;
+					auto lines = getGridLines(grid);
+					for (auto l : lines) {
+						if (hovering(l, grid.position)) {
+							hoveredEntity = &e;
+							return;
+						}
+					}
+				} break;
+				case Entity_circle: {
+					CircleEntity &circle = e.circle;
+					auto lines = getCircleLines(circle);
+					for (auto l : lines) {
+						if (hovering(l, circle.position)) {
+							hoveredEntity = &e;
+							return;
+						}
+					}
+				} break;
+				default: {
+					INVALID_CODE_PATH();
+				} break;
+			}
+		}
+	}
+}
+
+//void openImageContextMenu(ImageAction &image) {
+//
+//}
+
+bool proceedCloseScene() {
+	bool proceed = true;
+	if (isUnsaved(currentScene)) {
+		showCursor();
+		proceed = platform_messageBox(localizations[language].unsavedScene, localizations[language].warning, MessageBoxType::warning);
+		hideCursor();
+	}
+	return proceed;
+}
+
+void app_onKeyDown(u8 key) {
+	keysDown[key] = true;
+	keysHeld[key] = true;
+	if (!draggingEntity && !rotatingEntity && !scalingImage && !cameraPanning) {
+		if (keyHeld(Key_control)) {
+			if (key == 'S') {
+				if (keyHeld(Key_shift)) {
+					saveSceneDialog(currentScene);
+				} else {
+					saveScene(currentScene);
+				}
+			} else if (key == 'O') {
+				resetKeys = true;
+				if (proceedCloseScene()) {
+					if (openSceneDialog(currentScene)) {
+						generateGfxData(currentScene);
+						updateWindowText = true;
+					}
+				}
+			} else if (key == 'W') {
+				bool close = true;
+				if (isUnsaved(currentScene)) {
+					showCursor();
+					close = platform_messageBox(localizations[language].unsavedScene, localizations[language].warning, MessageBoxType::warning);
+					hideCursor();
+				}
+				if (close) {
+					closeScene(currentScene);
+					updateWindowText = true;
+				}
+			}
+		} else {
+			if (key == Key_tab) {
+				colorMenuOpened = false;
+				if (mainPieMenu.opened) {
+					closePieMenu(mainPieMenu);
+				} else {
+					if (!draggingEntity && !scalingImage && !rotatingEntity && !keyHeld(Key_shift)) {
+						openPieMenu(mainPieMenu);
+					}
+				}
+			} else if (key == Key_f1) {
+				toggleConsoleWindow();
+			} else if (key == Key_f2) {
+				if (isDebuggerAttached())
+					DEBUG_BREAK;
+			} else if (key == Key_f3) {
+				renderer->switchRasterizer();
+				currentScene->needRepaint = true;
+			} else if (key == Key_f4) {
+				renderer->setMultisampleEnabled(!renderer->isMultisampleEnabled());
+				currentScene->needRepaint = true;
+			} else if (key == Key_f5) {
+				loadSceneStressTest();
+			} else if (key == Key_f6) {
+				drawBounds = !drawBounds;
+			} else if (key == Key_f7) {
+				debugPencil = !debugPencil;
+			//} else if (key == Key_f8) {
+			//	renderer->debugSaveRenderTarget();
+#if 0
+			} else if (key == Key_f8) {
+				if (net::init()) {
+					listener = net::createSocket();
+					if (listener) {
+						net::bind(listener, 12345);
+						net::listen(listener);
+						std::thread([&] {
+							auto server = net::createServer(listener);
+							server->onClientConnected = [](net::Server *server, void *context, net::Socket s, char *host, char *service, u16 port) {
+								LOG("New connection: '%', '%', '%', '%'", s, host, service, port);
+							};
+							server->onClientDisconnected = [](net::Server *server, void *context, net::Socket s) {
+								LOG("Disconnected: '%'", s);
+							};
+							server->onClientMessageReceived = [](net::Server *server, void *context, net::Socket s, u8 *data, u32 size) {
+								LOG("Client message received (% bytes)", size);
+
+#define READ(x) x = *(decltype(x) *)data; data += sizeof(x); size -= sizeof(x)
+
+								while (size) {
+									NetMessage messageType;
+									READ(messageType);
+									switch (messageType)
+									{
+									case Net_startAction: {
+										SCOPED_LOCK(renderer->getMutex());
+										SCOPED_LOCK(currentNetAction.mutex);
+										PencilAction pencil = {};
+										renderer->initPencilAction(pencil);
+										READ(pencil.color);
+										renderer->initDynamicLineArray(pencil.renderData, 0, pencilLineBufferDefElemCount);
+										currentNetAction.action = std::move(pencil);
+										registerAction(currentScene, currentNetAction.action);
+									} break;
+									case Net_updateAction: {
+										SCOPED_LOCK(renderer->getMutex());
+										SCOPED_LOCK(currentNetAction.mutex);
+										auto &pencil = currentNetAction.action.pencil;
+										Line line;
+										READ(line);
+										pushLine(pencil, line);
+										renderer->resizePencilLineArray(pencil);
+										renderer->updateLastElement(pencil);
+										currentScene->needRepaint = true;
+									} break;
+									case Net_stopAction: {
+										SCOPED_LOCK(currentNetAction.mutex);
+										switch (currentNetAction.action.type) {
+											case Action_pencil: {
+												auto &pencil = currentNetAction.action.pencil;
+												renderer->freeze(pencil);
+												receivedActions.push(std::move(currentNetAction.action));
+											} break;
+											case Action_grid:
+											case Action_line: 
+											case Action_circle:
+												break;
+											default: INVALID_CODE_PATH();
+										}
+									} break;
+									default:
+										break;
+									}
+								}
+							};
+							net::run(server);
+						}).detach();
+						LOG("Server initialized");
+					} else {
+						LOG("net::createSocket() failed");
+					}
+				} else {
+					LOG("net::init() failed");
+				}
+			} else if (key == Key_f9) {
+				if (net::init()) {
+					connection = net::createSocket();
+					if (connection) {
+						if (net::connect(connection, "127.0.0.1", 12345)) {
+							LOG("Connected");
+						} else {
+							LOG("net::connect() failed");
+						}
+					} else {
+						LOG("net::createSocket() failed");
+					}
+				} else {
+					LOG("net::init() failed");
+				}
+#endif
+			} else if (key >= '0' && key <= '9') {
+				if (!currentEntity) {
+					u32 newIndex = key - '0';
+					u32 currentIndex = currentScene - scenes;
+					if (newIndex != currentIndex) {
+						previousScene = currentScene;
+						currentScene = scenes + newIndex;
+						if (!currentScene->initialized)
+							initializeScene(currentScene);
+						thicknessChanged = true;
+						cameraDistanceChanged = true;
+						mouseScenePosChanged = true;
+						playingSceneShiftAnimation = true;
+						sceneShiftT = 0.0f;
+						updateWindowText = true;
+					}
+				}
+			}
+		}
+	}
+	if (key == Key_escape) {
+		colorMenuOpened = false;
+	}
+}
+void app_onKeyDownRepeated(u8 key) {
+	keysDownRep[key] = true;
+	if (!draggingEntity && !rotatingEntity && !scalingImage) {
+		if (key == 'Z') {
+			if (keyHeld(Key_control)) {
+				if (!currentEntity) {
+					if (keyHeld(Key_shift)) {
+						redo();
+					} else {
+						undo();
+					}
+				}
+			}
+		}
+	}
+}
+void app_onKeyUp(u8 key) {
+	keysUp[key] = true;
+	keysHeld[key] = false;
+	if (key == Key_tab) {
+		if (mainPieMenu.opened) {
+			mainPieMenu.rightMouseReleased = true;
+		}
+	}
+}
+
+void app_onMouseDown(u8 button) {
+	mouseButtons[button] = true;
+	if (button == mouseButton_middle) {
+		cameraPanning = true;
+	}
+}
+void app_onMouseUp(u8 button) {
+	mouseButtons[button] = false;
+	if (button == mouseButton_middle) {
+		cameraPanning = false;
+	}
+}
+
+struct f32c {
+	static constexpr u32 exponentBias = 127;
+	static constexpr u32 exponentMask = 0xFF;
+	static constexpr u32 mantissaMask = 0x7FFFFF;
+	static constexpr u32 mantissaHighestBit = 0x800000;
+	static constexpr u32 mantissaCarryBit = 0x1000000;
+	static constexpr u32 biasedZero = 0x81;
+	static constexpr u32 biasedOne = 0x82;
+
+	struct s {
+		s32 exponent;
+		u32 mantissa;
+		bool negative;
+		bool isNan;
+		bool isInfinity;
+	};
+	inline static s getS(f32c v) {
+		// Step 2:
+		// Extract the sign, the biased exponent, and the mantissa. 
+		// Add any implicit leading bit to the mantissa.
+		// Check whatever special rules there are: 
+		// In the IEEE 754 32 and 64 bit format, a biased exponent of 0 means that there is no implicit leading bit in the mantissa,
+		// but the exponent should be treated as if it was 1. Add three extra bits containing zeroes to the mantissa.
+		s result = {};
+		result.exponent = (v.u >> 23) & exponentMask;
+		result.mantissa = v.u & mantissaMask;
+		result.negative = v.u >> 31;
+
+		if (result.exponent) {
+			if (result.exponent == exponentMask) {
+				if (result.mantissa) {
+					result.isNan = true;
+					return result;
+				} else {
+					result.isInfinity = true;
+					return result;
+				}
+			}
+			result.mantissa |= 0x800000;
+			result.exponent -= exponentBias;
+		} else {
+			result.exponent = result.mantissa == 0 ? 129 : 1;
+		}
+		result.mantissa <<= 3;
+		return result;
+	}
+	inline static f32c make(s s) {
+		// Step 7:
+		// Perform rounding according to IEEE 754 rules.
+		// That's where the three extra mantissa bits are used. Remove the extra 3 mantissa bits.
+		// Due to the "round to even" rule, you round up (increase the mantissa by 1) if the last bit is 0 and the bits removed are 101 or larger,
+		// or the last bit is 1 and the bits removed are 100 or larger.
+		u32 lastBits = s.mantissa & 0x7;
+		s.mantissa >>= 3;
+		bool roundedUp = false;
+		if (s.mantissa & 1) {
+			if (lastBits >= 4) {
+				++s.mantissa;
+				roundedUp = true;
+			}
+		} else {
+			if (lastBits >= 5) {
+				++s.mantissa;
+				roundedUp = true;
+			}
+		}
+
+		// Step 8:
+		// If you rounded up and there is a carry then shift the mantissa one bit to the right and increase the exponent.
+		// If the biased exponent is too large then the result is infinity.
+		// If the biased exponent is 1 and the highest mantissa bit is zero then the biased exponent is changed to 0.
+		if (roundedUp) {
+			if (s.mantissa & mantissaCarryBit) {
+				s.mantissa >>= 1;
+				++s.exponent;
+				if ((s.exponent == 1) && ((s.mantissa & mantissaHighestBit) != mantissaHighestBit)) {
+					s.exponent = biasedZero;
+				}
+			}
+		}
+		
+		// Step 9:
+		// Drop the highest bit of the mantissa, and pack sign, biased exponent, and mantissa together. 
+		f32c r;
+		r.u = ((u32)s.negative << 31) | ((u32)((s.exponent + exponentBias) & exponentMask) << 23) | (s.mantissa & mantissaMask);
+		return r;
+	}
+
+	union {
+		u32 u;
+		f32 f;
+	};
+	f32c() {}
+	f32c(f32 f) : f(f) {}
+	friend f32c operator+(f32c a, f32c b) {
+	beginning:
+		f32c check = a.f + b.f;
+		
+		// Step 1: 
+		// Determine if any of the operands is an Infinity or a Not-A-Number. 
+		// In this case, look up the IEEE 754 standard and determine the result accordingly.
+
+
+		s as = getS(a);
+		s bs = getS(b);
+		s cs = getS(check);
+
+		if (as.isNan || bs.isNan) {
+			return NAN;
+		}
+
+		//ASSERT(make(as).u == a.u);
+		//ASSERT(make(bs).u == b.u);
+		//ASSERT(make(cs).u == check.u);
+		
+		// Step 3:
+		// Make sure the exponents are the same.
+		// If one number has an exponent that is smaller by k, then shift that numbers mantissa to the right by k bit positions.
+		// If k is greater than 3, then set the last bit of the mantissa to 1 if any non-zero bits were shifted out. 
+		// If k is so large that all mantissa bits would be shifted out then set the mantissa to zero, and don't try to shift by some huge amount.
+		if (as.exponent != bs.exponent) {
+			s *min, *max;
+			if (as.exponent > bs.exponent) {
+				min = &bs;
+				max = &as;
+			} else {
+				min = &as;
+				max = &bs;
+			}
+
+			u32 k = max->exponent - min->exponent;
+			if (k >= 27) {
+				min->mantissa = 0;
+			} else if (k > 3) {
+				bool hasBits = min->mantissa & ((1 << k) - 1);
+				min->mantissa >>= k;
+				if (hasBits) {
+					min->mantissa |= 1;
+				}
+			} else {
+				min->mantissa >>= k;
+			}
+			min->exponent = max->exponent;
+		}
+
+		// Step 4: 
+		// If the operands have different signs and the second mantissa is larger then exchange the operands. 
+		// Add or subtract the mantissas, depending on the sign bits.
+		s rs;
+		if (as.negative != bs.negative && bs.mantissa > as.mantissa) {
+			std::swap(as, bs);
+		}
+		if (as.negative == bs.negative) {
+			rs.mantissa = as.mantissa + bs.mantissa;
+		} else {
+			if (as.mantissa == bs.mantissa && as.exponent == bs.exponent) {
+				return 0.0f;
+			}
+			rs.mantissa = as.mantissa - bs.mantissa;
+		}
+		rs.negative = as.negative;
+
+		// Step 5: 
+		// If you added the mantissas and there was a carry, then increase the exponent, and shift the mantissa one bit position to the right.
+		// If the bit that is shifted out is non-zero, then set the last bit of the mantissa.
+		rs.exponent = as.exponent;
+		if (rs.mantissa & (mantissaCarryBit << 3)) {
+			++rs.exponent;
+			u32 lastBit = rs.mantissa & 1;
+			rs.mantissa >>= 1;
+			rs.mantissa |= lastBit;
+		}
+
+		// Step 6:
+		// If you subtracted the mantissas then count the number of leading zero bits in the mantissa.
+		// If all mantissa bits are zero then set the biased exponent to 1.
+		// Otherwise, shift the mantissa to the left and decrease the exponent, making sure that the biased exponent doesn't get smaller than 1.
+		if (as.negative != bs.negative) {
+			u32 lzc = countLeadingZeros(rs.mantissa) - 5;
+			if (rs.mantissa == 0) {
+				rs.exponent = 129;
+			} else if (lzc) {
+				if (rs.exponent > lzc) {
+					rs.mantissa <<= lzc;
+					rs.exponent -= lzc;
+				} else {
+					rs.mantissa <<= lzc - rs.exponent;
+					rs.exponent = 1;
+				}
+			}
+		}
+
+		f32c result = make(rs);
+
+		if (result.u != check.u) {
+			DEBUG_BREAK;
+			goto beginning;
+		}
+
+		return result;
+	}
+};
+
+void f32test() {
+	f32c fa;
+	f32c fb;
+	f32c fc;
+	fa = -522975.969f;
+	fb = 66674.0625f;
+	fc = fa + fb;
+	fa = -321593.813;
+	fb = 323737.875;
+	fc = fa + fb;
+	fa = 124659.813;
+	fb = -124659.813;
+	fc = fa + fb;
+	fa = -1.95598008e+10f;
+	fb = 4.73311009e-18f;
+	fc = fa + fb;
+	fa = -8.23324077e-20f;
+	fb = 1.01678475e-12f;
+	fc = fa + fb;
+
+	std::mt19937 mt{};
+	for (u32 i = 0; i < 0x1000; ++i) {
+		fa.u = mt();
+		fb.u = mt();
+		fc = fa + fb;
+	}
+}
+
+int wmain(int argc, wchar **argv) {
+	Span<wchar *> args = {argv, (umm)argc};
+	platform_init();
+	DEFER { platform_deinit(); };
+
+	start(args);
+
+	//f32test();
 
 	while (running) {
 		mouseDelta = {};
@@ -1909,39 +1762,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int) {
 		memset(keysDown, 0, sizeof(keysDown));
 		memset(keysUp, 0, sizeof(keysUp));
 		memcpy(prevMouseButtons, mouseButtons, sizeof(mouseButtons));
-		MSG message;
-		while (PeekMessageA(&message, 0, 0, 0, PM_REMOVE)) {
-			switch (message.message) {
-				case WM_KEYUP:
-				case WM_KEYDOWN:
-				case WM_SYSKEYUP:
-				case WM_SYSKEYDOWN: {
-					auto code = (u8)message.wParam;
-					[[maybe_unused]] bool extended = message.lParam & u32(1 << 24);
-					bool alt = message.lParam & u32(1 << 29);
-					bool isRepeated = message.lParam & u32(1 << 30);
-					bool wentUp = message.lParam & u32(1 << 31);
-					if (code == VK_F4 && alt) {
-						tryExitApp();
-					}
-					keysDownRep[code] = !wentUp;
-					if (isRepeated == wentUp) {
-						keysDown[code] = !wentUp;
-						keysHeld[code] = !wentUp;
-						keysUp[code] = wentUp;
-					}
-				} continue;
-				case WM_LBUTTONDOWN: mouseButtons[0] = true;  continue;
-				case WM_RBUTTONDOWN: mouseButtons[1] = true;  continue;
-				case WM_MBUTTONDOWN: mouseButtons[2] = true;  continue;
-				case WM_LBUTTONUP:   mouseButtons[0] = false; continue;
-				case WM_RBUTTONUP:   mouseButtons[1] = false; continue;
-				case WM_MBUTTONUP:   mouseButtons[2] = false; continue;
-				case WM_MOUSEWHEEL: mouseWheel = GET_WHEEL_DELTA_WPARAM(message.wParam) / WHEEL_DELTA; continue;
-			}
-			TranslateMessage(&message);
-			DispatchMessageA(&message);
-		}
+
+		thicknessChanged = false;
+		mouseScenePosChanged = false;
+		smoothMousePosChanged = false;
+		cameraDistanceChanged = false;
+
+		hoveredEntity = 0;
+		exitSizeMove = false;
+		lostFocus = false;
+
+		platform_beginFrame();
+
+		if (!running)
+			break;
 		resetKeys |= lostFocus || exitSizeMove;
 		if (resetKeys) {
 			resetKeys = false;
@@ -1950,112 +1784,123 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int) {
 			memset(keysHeld    , 0, sizeof(keysHeld));
 			memset(mouseButtons, 0, sizeof(mouseButtons));
 		}
-		lostFocus = false;
-		exitSizeMove = false;
 
-		bool smoothMouseWorldPosChanged = false;
+		needRepaint = exitSizeMove;
 		
-		f32 colorMenuSize = min(windowSize.x, windowSize.y) * 0.2f;
-		bool hoveringColorMenu = colorMenuOpened && inBounds((v2f)mousePosBL, aabbMinDim(colorMenuPosition, V2f(colorMenuSize)));
+		prevMousePos = mousePosTL;
 
-		prevMousePos = mousePos;
+		mousePosTL = getMousePos();
+		
+		
+		f32 colorMenuSize = min(clientSize.x, clientSize.y) * 0.2f;
+		v2f cursorRelativeColorMenu = ((v2f)mousePosTL - colorMenuPositionTL) / colorMenuSize;
 
-		if (ignoreCursorFrameCount) {
-			--ignoreCursorFrameCount;
-		} else {
-			POINT cursorPos;
-			GetCursorPos(&cursorPos);
-			mousePos.x = cursorPos.x - windowPos.x;
-			mousePos.y = cursorPos.y - windowPos.y;
+		auto containsTriangle = [](v2f point, f32 size) {
+			return 
+				dot(point, v2f{ 0,                    1   }) <= 0.5f * size &&
+				dot(point, v2f{ cosf(radians(30.0f)),-0.5f}) <= 0.5f * size &&
+				dot(point, v2f{-cosf(radians(30.0f)),-0.5f}) <= 0.5f * size;
+		};
+
+		// inBounds((v2f)mousePosBL, aabbMinDim(colorMenuPosition, V2f(colorMenuSize)));
+		bool hoveringColorMenu = colorMenuOpened && containsTriangle(cursorRelativeColorMenu, 1.0f);
+
+		mousePosBL.x = mousePosTL.x;
+		mousePosBL.y = clientSize.y - mousePosTL.y;
+		
+		if (debugPencil) {
+			static f32 time = 0;
+			static f32 printTimer = 0;
+			static u32 lineCounter = 0;
+			static auto previousTimePoint = std::chrono::high_resolution_clock::now();
+			smoothMousePosChanged = true;
+			mouseScenePosChanged = true;
+			mousePosBL = (v2s)(v2f{cosf(time), sinf(time)} * map(sinf(time * sqrt2), -1, 1, 0, minWindowDim * 0.49f) + (v2f)clientSize * 0.5f);
+			f32 delta = 0.1f;
+			time += delta;
+			++lineCounter;
+			auto currentTimePoint = std::chrono::high_resolution_clock::now();
+			printTimer += (currentTimePoint - previousTimePoint).count() / 1000000000.0;
+			if (printTimer >= 1) {
+				printTimer -= 1;
+				LOG("lines added: %", lineCounter);
+				lineCounter = 0;
+			}
+			previousTimePoint = currentTimePoint;
+			mouseButtons[mouseButton_left] = true;
 		}
-		
-		mousePosBL.x = mousePos.x;
-		mousePosBL.y = windowSize.y - mousePos.y;
+		renderer->setVSync(!debugPencil);
 
-		mouseDelta = mousePos - prevMousePos;
+		mouseDelta = mousePosTL - prevMousePos;
 		
-		static bool prevMouseHovering = false;
-		bool mouseHovering = inBounds(mousePos, aabbMinMax(v2s{}, (v2s)windowSize));
-		bool mouseExited = !mouseHovering && prevMouseHovering;
-		prevMouseHovering = mouseHovering;
+		bool mouseHovering = inBounds(mousePosTL, aabbMinMax(v2s{}, (v2s)clientSize));
+		bool mouseExited = !mouseHovering && previousMouseHovering;
 
-		if (mouseHovering) {
-			hideCursor();
-		} else {
-			showCursor();
-		}
+		cursorVisible = !mouseHovering;
 
 		bool gridCellCountChanged = false;
 		if (!hoveringColorMenu && mouseWheel) {
-			if (keyHeld(VK_CONTROL)) {
-				switch (currentAction.type) {
-					case ActionType_none: break;
-					case ActionType_pencil: break;
-					case ActionType_line: break;
-					case ActionType_grid: {
-						displayGridSize = currentAction.grid.cellCount = (u32)max((s32)currentAction.grid.cellCount + mouseWheel, 1);
-						updateWindowText = true;
-						release(currentAction.grid.buffer);
-						currentAction.grid.buffer = d3d11State.createStructuredBuffer(currentAction.grid.cellCount * 2 + 2, sizeof(TransformedLine), 0, D3D11_USAGE_DYNAMIC);
-						gridCellCountChanged = true;
-					} break;
-					default:
-						break;
+			if (draggingEntity) {
+				/*
+				if (keyHeld(Key_control)) {
+					u32 draggingImageIndex = (u32)((Action *)draggingImage - currentScene->actions.data());
+					u32 swapImageIndex = draggingImageIndex - sign(mouseWheel);
+					if (swapImageIndex < currentScene->postLastVisibleActionIndex) {
+						std::swap(currentScene->actions[draggingImageIndex], currentScene->actions[swapImageIndex]);
+						draggingImage = &currentScene->actions[swapImageIndex].image;
+					}
+				} else {
+					f32 t = pow(1.1f, mouseWheel);
+					draggingImage->size *= t;
 				}
-			} else if (keyHeld(VK_SHIFT)) {
-				targetThickness = clamp(targetThickness / pow(1.1f, mouseWheel), 2, 1000);
-			} else {
-				targetCameraDistance /= pow(1.1f, mouseWheel);
-				targetCameraDistance = clamp(targetCameraDistance, 1.0f / 8, 64);
+				*/
+			} else if (!rotatingEntity) {
+				if (keyHeld(Key_control)) {
+					if (currentEntity) {
+						switch (currentEntity->type) {
+							case Entity_grid: {
+								u32 dimIndex = !keyHeld(Key_shift);
+								displayGridSize[dimIndex] = 
+									currentEntity->grid.cellCount[dimIndex] = 
+									(u32)max((s32)currentEntity->grid.cellCount[dimIndex] + mouseWheel, 1);
+								updateWindowText = true;
+								renderer->reinitDynamicLineArray(
+									currentEntity->grid.renderData, 0, 
+									currentEntity->grid.cellCount.x + currentEntity->grid.cellCount.y + 2
+								);
+								gridCellCountChanged = true;
+							} break;
+						}
+					}
+				} else if (keyHeld(Key_shift)) {
+					targetThickness = clamp(targetThickness / pow(1.1f, mouseWheel), 4, maxWindowDim);
+				} else {
+					f32 oldTargetCameraDistance = currentScene->targetCameraDistance;
+					currentScene->targetCameraDistance /= pow(1.1f, mouseWheel);
+					currentScene->targetCameraDistance = clamp(currentScene->targetCameraDistance, 1.0f / 8, 64);
+					currentScene->targetCameraPosition = lerp(mouseScenePos, currentScene->targetCameraPosition, currentScene->targetCameraDistance / oldTargetCameraDistance);
+				}
 			}
 		}
 		oldCameraDistance = currentScene->cameraDistance;
-		if (distance(currentScene->cameraDistance, targetCameraDistance) < currentScene->cameraDistance * 0.001f) {
-			currentScene->cameraDistance = targetCameraDistance;
+		if (distance(currentScene->cameraDistance, currentScene->targetCameraDistance) < currentScene->cameraDistance * 0.001f) {
+			currentScene->cameraDistance = currentScene->targetCameraDistance;
 		} else {
-			currentScene->cameraDistance = lerp(currentScene->cameraDistance, targetCameraDistance, 0.5f);
+			currentScene->cameraDistance = lerp(currentScene->cameraDistance, currentScene->targetCameraDistance, cameraMoveSpeed);
 		}
 
-		oldThickness = currentScene->drawThickness;
-		if (distance(currentScene->drawThickness, targetThickness) < currentScene->cameraDistance * 0.001f) {
-			currentScene->drawThickness = targetThickness;
+		oldThickness = currentScene->windowDrawThickness;
+		if (distance(currentScene->windowDrawThickness, targetThickness) < currentScene->cameraDistance * 0.001f) {
+			currentScene->windowDrawThickness = targetThickness;
 		} else {
-			currentScene->drawThickness = lerp(currentScene->drawThickness, targetThickness, 0.5f);
+			currentScene->windowDrawThickness = lerp(currentScene->windowDrawThickness, targetThickness, 0.5f);
 		}
 
 
-		bool thicknessChanged = currentScene->drawThickness != oldThickness;
-		bool cameraDistanceChanged = currentScene->cameraDistance != oldCameraDistance;
+		cameraDistanceChanged |= currentScene->cameraDistance != oldCameraDistance;
+		thicknessChanged |= (currentScene->windowDrawThickness != oldThickness) || cameraDistanceChanged;
 		bool mousePosChanged = mouseDelta.x || mouseDelta.y;
-		bool mouseWorldPosChanged = mousePosChanged || cameraDistanceChanged;
-
-		if (currentAction.type == ActionType_none) {
-			u32 numberKeyDown = ~0;
-				 if (keyDown('1')) numberKeyDown = 1;
-			else if (keyDown('2')) numberKeyDown = 2;
-			else if (keyDown('3')) numberKeyDown = 3;
-			else if (keyDown('4')) numberKeyDown = 4;
-			else if (keyDown('5')) numberKeyDown = 5;
-			else if (keyDown('6')) numberKeyDown = 6;
-			else if (keyDown('7')) numberKeyDown = 7;
-			else if (keyDown('8')) numberKeyDown = 8;
-			else if (keyDown('9')) numberKeyDown = 9;
-			else if (keyDown('0')) numberKeyDown = 0;
-			if (numberKeyDown != ~0 && numberKeyDown != (currentScene - scenes)) {
-				previousScene = currentScene;
-				currentScene = scenes + numberKeyDown;
-				if (!currentScene->initialized)
-					initializeScene(currentScene);
-				thicknessChanged = true;
-				smoothMouseWorldPosChanged = true;
-				targetCameraDistance = currentScene->cameraDistance;
-				cameraDistanceChanged = true;
-				mouseWorldPosChanged = true;
-				playingSceneShiftAnimation = true;
-				sceneShiftT = 0.0f;
-				updateWindowText = true;
-			}
-		}
+		mouseScenePosChanged |= mousePosChanged || cameraDistanceChanged;
 
 		if (playingSceneShiftAnimation) {
 			sceneShiftT = lerp(sceneShiftT, 1.0f, 0.3f);
@@ -2063,16 +1908,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int) {
 			if (1.0f - sceneShiftT < 0.001f) {
 				sceneShiftT = 0;
 				playingSceneShiftAnimation = false;
-				
-				D3D11_VIEWPORT v{};
-				v.Width = windowSize.x;
-				v.Height = windowSize.y;
-				v.MaxDepth = 1.0f;
-				d3d11State.immediateContext->RSSetViewports(1, &v);
 			}
 		}
 
-		if (mouseButtonHeld(2)) {
+		if (cameraPanning) {
 			cameraVelocity = -(v2f)mouseDelta * currentScene->cameraDistance;
 			cameraVelocity.y = -cameraVelocity.y;
 		} else {
@@ -2082,445 +1921,789 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int) {
 		if (lengthSqr(cameraVelocity) < 0.5f * currentScene->cameraDistance) {
 			cameraVelocity = {};
 		} else {
-			currentScene->cameraPosition += cameraVelocity;
+			currentScene->targetCameraPosition += cameraVelocity;
+			currentScene->matrixSceneToNDCDirty = true;
+		}
+		v2f prevCameraPosition = currentScene->cameraPosition;
+		currentScene->cameraPosition = lerp(currentScene->cameraPosition, currentScene->targetCameraPosition, cameraMoveSpeed);
+		if (distanceSqr(currentScene->cameraPosition, currentScene->targetCameraPosition) > currentScene->cameraDistance) {
 			currentScene->matrixSceneToNDCDirty = true;
 		}
 		
-		mouseWorldPos = getWorldPos(mousePosBL);
+		mouseScenePos = clientToScenePos(mousePosBL);
 		
-		static v2f smoothMouseWorldPos = {};
-		static v2f oldSmoothMouseWorldPos = {};
-		static f32 smoothMouseWorldPosT = 1.0f;
-		smoothMouseWorldPosT = moveTowards(smoothMouseWorldPosT, keyHeld(VK_MENU) && cursorHeld() ? 0.1f : 1.0f, 0.1f);
-		oldSmoothMouseWorldPos = smoothMouseWorldPos;
-		smoothMouseWorldPos = lerp(smoothMouseWorldPos, mouseWorldPos, smoothMouseWorldPosT);
-		smoothMouseWorldPosChanged |= (cursorHeld() || mouseHovering) && distanceSqr(smoothMouseWorldPos, oldSmoothMouseWorldPos) > currentScene->cameraDistance * 0.01f;
+		smoothMousePosT = moveTowards(
+			smoothMousePosT, 
+			(keyHeld(Key_shift) && mouseButtonHeld(0) && !manipulatingEntity() && smoothable(currentScene->tool)) ? 0.1f : 1.0f, 
+			0.1f
+		);
+		oldSmoothMousePos = smoothMousePos;
+		smoothMousePos = lerp(smoothMousePos, (v2f)mousePosBL, smoothMousePosT);
+		smoothMousePosChanged |= (mouseButtonHeld(0) || mouseHovering) && distanceSqr(smoothMousePos, oldSmoothMousePos) > 0.01f;
+		v2f smoothMouseScenePos = clientToScenePos(smoothMousePos);
 		
 		if (cameraDistanceChanged) {
 			currentScene->matrixSceneToNDCDirty = true;
 		}
-		if (cameraDistanceChanged || thicknessChanged) {
-			currentScene->constantBufferData.drawThickness = getDrawThickness(currentScene);
+		if (thicknessChanged) {
 			currentScene->constantBufferDirty = true;
 		}
 
-		if (keyDownRep('Z')) {
-			if (keyHeld(VK_CONTROL)) {
-				if (currentAction.type == ActionType_none) {
-					if (keyHeld(VK_SHIFT)) {
-						if (currentScene->postLastVisibleActionIndex < currentScene->actions.size()) {
-							currentScene->postLastVisibleActionIndex++;
-							currentScene->needRepaint = true;
-						}
-					} else {
-						if (currentScene->postLastVisibleActionIndex) {
-							currentScene->postLastVisibleActionIndex--;
-							currentScene->needRepaint = true;
-						}
-					}
-				}
-			}
-		} else if (keyDown('S')) {
-			if (keyHeld(VK_CONTROL)) {
-				if (keyHeld(VK_SHIFT)) {
-					resetKeys = true;
-					saveSceneAs(currentScene);
-				} else {
-					resetKeys = true;
-					saveScene(currentScene);
-				}
-			}
-		} else if (keyDown('O')) {
-			if (keyHeld(VK_CONTROL)) {
-				showCursor();
-				resetKeys = true;
-				bool openNewScene = true;
-				if (isUnsaved(currentScene)) {
-					if (MessageBoxW(mainWindow, localizations[language].unsavedScene, localizations[language].warning, MB_OKCANCEL | MB_ICONWARNING) != IDOK) {
-						openNewScene = false;
-					}
-				}
-				if (openNewScene) {
-					auto newScene = std::move(*currentScene);
-					openScene(&newScene);
-					targetCameraDistance = newScene.cameraDistance;
-					*currentScene = std::move(newScene);
-					updateWindowText = true;
-				}
-			}
-		} else if (keyDown(VK_F1)) {
-			toggleConsoleWindow();
-		} else if (keyDown(VK_F2)) {
-			DEBUG_BREAK;
-		} else if (keyDown(VK_F3)) {
-			if (currentRasterizer == defaultRasterizer)
-				currentRasterizer = wireframeRasterizer;
-			else
-				currentRasterizer = defaultRasterizer;
-			currentScene->needRepaint = true;
-		}
-		if (colorMenuOpened && keyDown(VK_ESCAPE)) {
-			colorMenuOpened = false;
-		}
 		if (hoveringColorMenu) {
-			showCursor();
-			if (cursorDown()) {
-				colorMenuSelecting = true;
+			cursorVisible = true;
+			if (mouseButtonDown(0)) {
+				if (containsTriangle(cursorRelativeColorMenu, SV_TRIANGLE_SIZE)) {
+					colorMenuSelectingSV = true;
+				} else {
+					colorMenuSelectingH = true;
+				}
 			}
-			if (mouseWheel) {
-				v3f rgb;
-				switch (colorMenuTarget) {
-					case ColorMenuTarget_draw: rgb = currentScene->drawColor; currentScene->drawColorDirty = true; break;
-					case ColorMenuTarget_canvas: rgb = canvasColor.xyz; currentScene->needRepaint = true; break;
-				}
+			//if (mouseWheel) {
+			//	v3f rgb;
+			//	switch (colorMenuTarget) {
+			//		case ColorMenuTarget_draw: rgb = currentScene->drawColor; currentScene->drawColorDirty = true; break;
+			//		case ColorMenuTarget_canvas: rgb = currentScene->canvasColor; currentScene->needRepaint = true; break;
+			//	}
 
-				colorMenuHue = frac(colorMenuHue + mouseWheel * 0.01f);
-				v3f hsv = rgbToHsv(rgb);
-				hsv.x = colorMenuHue;
-				rgb = hsvToRgb(hsv);
+			//	colorMenuHue = frac(colorMenuHue + mouseWheel * 0.01f);
+			//	v3f hsv = rgbToHsv(rgb);
+			//	hsv.x = colorMenuHue;
+			//	rgb = hsvToRgb(hsv);
 
-				switch (colorMenuTarget) {
-					case ColorMenuTarget_draw: currentScene->drawColor = rgb; break;
-					case ColorMenuTarget_canvas: canvasColor.xyz = rgb; break;
-				}
+			//	currentScene->constantBufferData.colorMenuColor = rgb;
+			//	switch (colorMenuTarget) {
+			//		case ColorMenuTarget_draw: currentScene->drawColor = rgb; break;
+			//		case ColorMenuTarget_canvas: currentScene->canvasColor = rgb; break;
+			//	}
+			//}
+		}
+		if (draggingEntity) {
+			draggingEntity->position = mouseScenePos - draggingEntityOffset;
+			draggingEntity->hovered = true;
+			currentScene->needRepaint = true;
+			if (drawBounds) {
+				calculateBounds(*draggingEntity);
 			}
 		}
-		if (colorMenuSelecting) {
-			if (cursorUp()) {
-				colorMenuSelecting = false;
+		if (rotatingEntity) {
+			targetImageRotation = rotatingEntityInitialAngle - atan2(mouseScenePos - rotatingEntity->position);
+
+			if (keyHeld(Key_control)) {
+				f32 const roundFactor = pi * 0.25f;
+				targetImageRotation = TL::round(targetImageRotation / roundFactor) * roundFactor;
 			}
-			if (cursorHeld()) {
+
+			rotatingEntity->rotation = lerpWrap(rotatingEntity->rotation, targetImageRotation, 0.5f, pi * 2);
+
+			rotatingEntity->hovered = true;
+			currentScene->needRepaint = true;
+			if (drawBounds) {
+				calculateBounds(*rotatingEntity);
+			}
+		}
+		if (scalingImage) {
+			m2 toGlobal = m2::rotation(-scalingImage->rotation);
+			m2 toLocal = m2::rotation(scalingImage->rotation);
+
+			struct Point {
+				v2f local;
+				v2f global;
+			};
+
+			Point topRight, topLeft, bottomRight, bottomLeft;
+			topRight   .local = scalingImage->size * 0.5f;
+			topLeft    .local = (scalingImage->size * v2f{-1, 1}) * 0.5f;
+			bottomLeft .local = -topRight.local;
+			bottomRight.local = -topLeft.local;
+			topRight   .global = (toGlobal * scalingImage->size) * 0.5f;
+			topLeft    .global = (toGlobal * (scalingImage->size * v2f{-1, 1})) * 0.5f;
+			bottomLeft .global = -topRight.global;
+			bottomRight.global = -topLeft.global;
+			topRight   .global += scalingImage->position;
+			topLeft    .global += scalingImage->position;
+			bottomLeft .global += scalingImage->position;
+			bottomRight.global += scalingImage->position;
+
+			v2f localMousePos = toLocal * (mouseScenePos - scalingImage->position);
+
+			Point anchor{}, opposite{};
+			v2f target{}, scaleMult{}, dir{};
+			f32 sizeScale{};
+			u32 sizeIndex{};
+			switch (scalingImageAnchor) {
+				case ImageScaling_left: {
+					anchor.global = (bottomRight.global + topRight.global) * 0.5f;
+					opposite.global = (bottomLeft.global + topLeft.global) * 0.5f;
+					dir = normalize(bottomLeft.global - bottomRight.global);
+					sizeScale = 1;
+					sizeIndex = 0;
+					goto edge;
+				} break;
+				case ImageScaling_right: {
+					anchor.global = (bottomLeft.global + topLeft.global) * 0.5f;
+					opposite.global = (bottomRight.global + topRight.global) * 0.5f;
+					dir = normalize(bottomRight.global - bottomLeft.global);
+					sizeScale = -1;
+					sizeIndex = 0;
+					goto edge;
+				} break;
+				case ImageScaling_top: {
+					anchor.global = (bottomLeft.global + bottomRight.global) * 0.5f;
+					opposite.global = (topLeft.global + topRight.global) * 0.5f;
+					dir = normalize(topLeft.global - bottomLeft.global);
+					sizeScale = -1;
+					sizeIndex = 1;
+					goto edge;
+				} break;
+				case ImageScaling_bottom: {
+					anchor.global = (topLeft.global + topRight.global) * 0.5f;
+					opposite.global = (bottomLeft.global + bottomRight.global) * 0.5f;
+					dir = normalize(bottomLeft.global - topLeft.global);
+					sizeScale = 1;
+					sizeIndex = 1;
+					goto edge;
+				} break;
+				case ImageScaling_topLeft:     anchor = bottomRight; opposite = topLeft;     scaleMult = v2f{ 1,-1}; break;
+				case ImageScaling_topRight:    anchor = bottomLeft;  opposite = topRight;    scaleMult = v2f{-1,-1}; break;
+				case ImageScaling_bottomLeft:  anchor = topRight;    opposite = bottomLeft;  scaleMult = v2f{ 1, 1}; break;
+				case ImageScaling_bottomRight: anchor = topLeft;     opposite = bottomRight; scaleMult = v2f{-1, 1}; break;
+				default:
+					INVALID_CODE_PATH("bad scalingImageAnchor");
+					break;
+			}
+			target = lerp(anchor.local, opposite.local, draggingPointUv);
+			target = (toGlobal * map(localMousePos, anchor.local, target, anchor.local, opposite.local)) + scalingImage->position;
+			// debugPoints.push_back({anchor.global, {0,1,0}});
+			// debugPoints.push_back({opposite.global, {0,0,1}});
+			// debugPoints.push_back({target, {1,0,0}});
+			scalingImage->size = toLocal * (anchor.global - target) * scaleMult;
+			goto end;
+
+		edge:
+			target = lerp(anchor.global, opposite.global, draggingPointUv.y);
+			if (anchor.global.y != target.y && anchor.global.y != opposite.global.y) {
+				target.y = map(mouseScenePos.y, anchor.global.y, target.y, anchor.global.y, opposite.global.y);
+			}
+			if (anchor.global.x != target.x && anchor.global.x != opposite.global.x) {
+				target.x = map(mouseScenePos.x, anchor.global.x, target.x, anchor.global.x, opposite.global.x);
+			}
+			target = anchor.global + dir * dot(dir, target - anchor.global);
+			scalingImage->size.s[sizeIndex] = sizeScale * (toLocal * (anchor.global - target)).s[sizeIndex];
+
+		end:
+			scalingImage->position = (anchor.global + target) * 0.5f;
+			scalingImage->hovered = true;
+			currentScene->needRepaint = true;
+			if (drawBounds) {
+				calculateBounds(*scalingImage);
+			}
+		}
+		if (colorMenuSelectingH) {
+			if (mouseButtonUp(0)) {
+				colorMenuSelectingH = false;
+			}
+			if (mouseButtonHeld(0)) {
 				v3f rgb;
 				switch (colorMenuTarget) {
 					case ColorMenuTarget_draw: rgb = currentScene->drawColor; currentScene->drawColorDirty = true; break;
-					case ColorMenuTarget_canvas: rgb = canvasColor.xyz; currentScene->needRepaint = true; break;
+					case ColorMenuTarget_canvas: rgb = currentScene->canvasColor; currentScene->needRepaint = true; break;
 				}
 
-				v2f d = clamp(((v2f)mousePosBL - colorMenuPosition) / colorMenuSize, v2f{}, V2f(1.0f));
 				v3f hsv = rgbToHsv(rgb);
-				hsv.x = colorMenuHue;
-				hsv.y = d.x;
-				hsv.z = d.y;
+				colorMenuHue = hsv.x = frac(map(atan2((v2f)mousePosTL - colorMenuPositionTL), -pi, pi, 0, 1) - 0.25f);
 				rgb = hsvToRgb(hsv);
 				
+				renderer->setColorMenuColor(currentScene, rgb);
+
 				switch (colorMenuTarget) {
 					case ColorMenuTarget_draw: currentScene->drawColor = rgb; break;
-					case ColorMenuTarget_canvas: canvasColor.xyz = rgb; break;
+					case ColorMenuTarget_canvas: currentScene->canvasColor = rgb; break;
+				}
+			}
+		} else if (colorMenuSelectingSV) {
+			if (mouseButtonUp(0)) {
+				colorMenuSelectingSV = false;
+			}
+			if (mouseButtonHeld(0)) {
+				v2f topCorner   = v2f{ 0,                   -1   };
+				v2f rightCorner = v2f{ cosf(radians(30.0f)), 0.5f};
+				v2f leftCorner  = v2f{-cosf(radians(30.0f)), 0.5f};
+				v2f topRight = (topCorner + rightCorner) * 0.5f;
+				f32 saturation = clamp(dot(cursorRelativeColorMenu / SV_TRIANGLE_SIZE - rightCorner, topCorner - rightCorner) / pow2(sqrt3), 0, 1);
+				f32 value      = clamp(dot(cursorRelativeColorMenu / SV_TRIANGLE_SIZE - leftCorner, topRight - leftCorner)    / pow2( 1.5f), 0, 1);
+				
+				v3f rgb = hsvToRgb({colorMenuHue, saturation, value});
+				
+				renderer->setColorMenuColor(currentScene, rgb);
+
+				switch (colorMenuTarget) {
+					case ColorMenuTarget_draw: currentScene->drawColor = rgb; currentScene->drawColorDirty = true; break;
+					case ColorMenuTarget_canvas: currentScene->canvasColor = rgb; currentScene->needRepaint = true; break;
 				}
 			}
 		} else {
-			if (cursorDown()) {
+			if (mouseButtonDown(0)) {
 				colorMenuOpened = false;
 			}
-			if (!mainPieMenu.opened && !toolPieMenu.opened && !canvasPieMenu.opened) {
-				if (cursorDown()) {
-					smoothMouseWorldPos = mouseWorldPos;
-					smoothMouseWorldPosChanged = true;
-					switch (currentScene->currentTool) {
-						case Tool_pencil: {
-							PencilAction pencil = {};
-							pencil.color = currentScene->drawColor;
-							pencil.newLineStartPoint.position = smoothMouseWorldPos;
-							// pencil.newLineStartPoint.color = currentScene->drawColor;
-							pencil.newLineStartPoint.thickness = getDrawThickness(currentScene);
-							pencil.lineBuffer = d3d11State.createStructuredBuffer(pencilLineBufferDefElemCount, sizeof(TransformedLine), 0, D3D11_USAGE_DEFAULT);
-							currentAction = std::move(pencil);
-						} break;
-						case Tool_line: {
-							LineAction line = {};
-							line.color = currentScene->drawColor;
-							line.initialPosition = line.line.b.position = smoothMouseWorldPos;
-							line.initialThickness = line.line.b.thickness = getDrawThickness(currentScene);
-							// line.line.a.color = line.line.b.color = currentScene->drawColor;
-							Point const *endpoint = 0;
-							if (keyHeld(VK_CONTROL) && currentScene->postLastVisibleActionIndex) {
-								endpoint = getEndpoint(currentScene->actions[currentScene->postLastVisibleActionIndex - 1]);
-							}
-							if (endpoint) {
-								line.line.a.position = endpoint->position;
-								line.line.a.thickness = endpoint->thickness;
-							} else {
-								line.line.a.position = line.initialPosition;
-								line.line.a.thickness = line.initialThickness;
-							}
-							line.buffer = d3d11State.createStructuredBuffer(1, sizeof(TransformedLine), 0, D3D11_USAGE_DYNAMIC);
-							currentAction = std::move(line);
-						} break;
-						case Tool_grid: {
-							GridAction grid = {};
-							grid.color = currentScene->drawColor;
-							grid.startPoint.position = grid.endPosition = smoothMouseWorldPos;
-							grid.startPoint.thickness = getDrawThickness(currentScene);
-							// grid.startPoint.color = currentScene->drawColor;
-							grid.cellCount = displayGridSize = 4;
-							updateWindowText = true;
-							grid.buffer = d3d11State.createStructuredBuffer(grid.cellCount * 2 + 2, sizeof(TransformedLine), 0, D3D11_USAGE_DYNAMIC);
-							currentAction = std::move(grid);
-						} break;
-					}
-				} 
-				if (cursorHeld()) {
-					switch (currentScene->currentTool) {
-						case Tool_dropper: {
-							if (mousePosChanged || cursorDown()) {
-								if (d3d11State.device3) {
-									DHR(d3d11State.immediateContext->Map(currentScene->canvasRT.tex, 0, D3D11_MAP_READ, 0, 0));
-									D3D11_BOX box = {};
-									box.left = mousePos.x;
-									box.top = mousePos.y;
-									box.right = box.left + 1;
-									box.bottom = box.top + 1;
-									box.back = 1;
-									struct {
-										u8 r, g, b, _;
-									} pixel;
-									d3d11State.device3->ReadFromSubresource(&pixel, 1, 1, currentScene->canvasRT.tex, 0, &box);
-									d3d11State.immediateContext->Unmap(currentScene->canvasRT.tex, 0);
-									currentScene->drawColor.x = pixel.r / 255.0f;
-									currentScene->drawColor.y = pixel.g / 255.0f;
-									currentScene->drawColor.z = pixel.b / 255.0f;
-									currentScene->drawColorDirty = true;
-								} else {
-									LOG("How to read from texture on device1?");
-								}
-							}
-						} break;
-						case Tool_pencil:
-						case Tool_line:
-						case Tool_grid: {
-							switch (currentAction.type) {
-								case ActionType_none: break;
-								case ActionType_pencil: {
-									auto &pencil = currentAction.pencil;
-									if (smoothMouseWorldPosChanged || thicknessChanged || currentScene->drawColorDirty) {
-										if (pencil.popNextTime) {
-											pencil.lines.pop_back();
-											pencil.transformedLines.pop_back();
-										}
-										Line newLine = {};
-						
-										Point const *endpoint = 0;
-										if (pencil.lines.size()) {
-											Line lastLine = pencil.lines.back();
-											newLine.a.position = lastLine.b.position;
-											newLine.a.thickness = lastLine.b.thickness;
-											// newLine.a.color = lastLine.b.color;
+			if (!draggingEntity && !rotatingEntity && !scalingImage && !currentEntity && !hoveringColorMenu) {
+				if (keyHeld(Key_shift)) {
+				} else {
+				}
+			}
+			if (mouseButtonUp(0)) {
+				if (draggingEntity) {
+					currentAction->translate.endPosition = draggingEntity->position;
+					calculateBounds(*draggingEntity);
+					draggingEntity->hovered = false;
+					draggingEntity = 0;
+					currentAction = 0;
+				}
+				if (scalingImage) {
+					currentAction->scale.endPosition = scalingImage->position;
+					currentAction->scale.endSize = scalingImage->size;
+					calculateBounds(*scalingImage);
+					scalingImage->hovered = false;
+					scalingImage = 0;
+					currentAction = 0;
+				}
+				if (rotatingEntity) {
+					rotatingEntity->rotation = positiveModulo(rotatingEntity->rotation, pi * 2);
+					currentAction->rotate.endAngle = rotatingEntity->rotation;
+					calculateBounds(*rotatingEntity);
+					rotatingEntity->hovered = false;
+					rotatingEntity = 0;
+					currentAction = 0;
+				}
+			}
+			if (!mainPieMenu.opened) {
+				if (!draggingEntity && !rotatingEntity && !scalingImage) {
+					if (currentScene->tool == Tool_hand) {
+						v2f uv;
+						findHoveredEntity();
+						if (hoveredEntity) {
+							hoveredEntity->hovered = true;
+							switch (hoveredEntity->type) {
+								case Entity_image: {
+									auto hoveredImage = &hoveredEntity->image;
+									hoveredImage->hovered = true;
+									bool inCenter = false;
+
+									v2f uv = hoveredImageUv;
+
+									//
+									// draggingPointUv ranges from 0 to 1
+									//
+									// if dragging the edge, then:
+									//
+									// draggingPointUv.x is distance from right edge to dragging point 
+									// looking from center (if it increases, dragging point moves anti-clockwise)
+									//
+									// draggingPointUv.y is distance from the opposite side to dragging point
+									// Example: dragging top edge
+									//        |<---X
+									//  ___________ 
+									//  |_|___o_|_| -
+									//  | |     | | ^
+									//  | |     | | |
+									//  |_|_____|_| |
+									//  |_|_____|_| |
+									//              Y
+									//
+
+									if (uv.x < 0.1f) {
+										if (uv.y < 0.1f) {
+											scalingImageAnchor = ImageScaling_bottomLeft;
+											draggingPointUv = 1 - uv;
+								
+											v2f topRight    = hoveredImage->size * 0.5f;
+											v2f topLeft     = (hoveredImage->size * v2f{-1, 1}) * 0.5f;
+											v2f bottomLeft  = -topRight;
+											v2f bottomRight = -topLeft;
+											m2 rotation = m2::rotation(-hoveredImage->rotation);
+											debugPoints.push_back({(rotation * lerp(topRight, bottomLeft, draggingPointUv)) + hoveredImage->position, {0,1,0}});
+										} else if (uv.y > 0.9f) {
+											scalingImageAnchor = ImageScaling_topLeft;
+											draggingPointUv = {1 - uv.x, uv.y};
 										} else {
-											if (keyHeld(VK_CONTROL) && currentScene->postLastVisibleActionIndex) {
-												endpoint = getEndpoint(currentScene->actions[currentScene->postLastVisibleActionIndex - 1]);
+											scalingImageAnchor = ImageScaling_left;
+											draggingPointUv = {1 - uv.y, 1 - uv.x};
+										}
+									} else if (uv.x > 0.9f) {
+										if (uv.y < 0.1f) {
+											scalingImageAnchor = ImageScaling_bottomRight;
+											draggingPointUv = {uv.x, 1 - uv.y};
+										} else if (uv.y > 0.9f) {
+											scalingImageAnchor = ImageScaling_topRight;
+											draggingPointUv = uv;
+										} else {
+											scalingImageAnchor = ImageScaling_right;
+											draggingPointUv = {uv.y, uv.x};
+										}
+									} else {
+										if (uv.y < 0.1f) {
+											scalingImageAnchor = ImageScaling_bottom;
+											draggingPointUv = {uv.x, 1 - uv.y};
+										} else if (uv.y > 0.9f) {
+											scalingImageAnchor = ImageScaling_top;
+											draggingPointUv = {1 - uv.x, uv.y};
+										} else {
+											inCenter = true;
+										}
+									}
+									if (mouseButtonDown(0)) {
+										if (keyHeld(Key_shift)) {
+											rotatingEntity = hoveredEntity;
+											rotatingEntityInitialAngle = rotatingEntity->rotation + atan2(mouseScenePos - rotatingEntity->position);
+
+											RotateAction rotateAction;
+											rotateAction.targetId = hoveredImage->id;
+											rotateAction.startAngle = hoveredImage->rotation;
+
+											currentAction = pushAction(currentScene, std::move(rotateAction));
+										} else {
+											if (inCenter) {
+												draggingEntity = hoveredEntity;
+												draggingEntityOffset = mouseScenePos - hoveredImage->position;
+
+												TranslateAction translateAction;
+												translateAction.targetId = hoveredImage->id;
+												translateAction.startPosition = hoveredImage->position;
+
+												currentAction = pushAction(currentScene, std::move(translateAction));
+											} else {
+												scalingImage = hoveredImage;
+								
+												ScaleAction scaleAction;
+												scaleAction.targetId = hoveredImage->id;
+												scaleAction.startPosition = hoveredImage->position;
+												scaleAction.startSize = hoveredImage->size;
+
+												currentAction = pushAction(currentScene, std::move(scaleAction));
+											}
+										}
+									}
+								} break;
+								case Entity_pencil:
+								case Entity_line: 
+								case Entity_grid:
+								case Entity_circle: {
+									if (mouseButtonDown(0)) {
+										if (keyHeld(Key_shift)) {
+											rotatingEntity = hoveredEntity;
+											rotatingEntityInitialAngle = rotatingEntity->rotation + atan2(mouseScenePos - rotatingEntity->position);
+
+											RotateAction rotateAction;
+											rotateAction.targetId = hoveredEntity->id;
+											rotateAction.startAngle = hoveredEntity->rotation;
+
+											currentAction = pushAction(currentScene, std::move(rotateAction));
+										} else {
+											draggingEntity = hoveredEntity;
+											draggingEntityOffset = mouseScenePos - hoveredEntity->position;
+
+											TranslateAction translateAction;
+											translateAction.targetId = hoveredEntity->id;
+											translateAction.startPosition = hoveredEntity->position;
+
+											currentAction = pushAction(currentScene, std::move(translateAction));
+										}
+									}
+								} break;
+							}
+						}
+						if (previousHoveredEntity != hoveredEntity) {
+							if (previousHoveredEntity) {
+								previousHoveredEntity->hovered = false;
+							}
+							currentScene->needRepaint = true;
+						}
+						previousHoveredEntity = hoveredEntity;
+					} else {
+						if (previousHoveredEntity) {
+							previousHoveredEntity->hovered = false;
+							currentScene->needRepaint = true;
+							previousHoveredEntity = 0;
+						}
+					}
+					if (mouseButtonDown(0)) {
+						smoothMousePos = (v2f)mousePosBL;
+						smoothMouseScenePos = clientToScenePos(smoothMousePos);
+						smoothMousePosChanged = true;
+						switch (currentScene->tool) {
+							case Tool_pencil: {
+								PencilEntity pencil = {};
+								renderer->initPencilEntity(pencil);
+
+								Optional<Point> endpoint;
+								if (keyHeld(Key_control)) {
+									endpoint = getEndpoint(currentScene, pencil.id);
+								}
+								if (endpoint) {
+									pencil.position = endpoint->position;
+									pencil.previousEndThickness = pencil.newLineStartPoint.thickness = endpoint->thickness;
+								} else {
+									pencil.position = smoothMouseScenePos;
+									pencil.previousEndThickness = pencil.newLineStartPoint.thickness = getDrawThickness(currentScene);
+								}
+								pencil.newLineStartPoint.position = {};
+								pencil.color = currentScene->drawColor;
+
+								renderer->initDynamicLineArray(pencil.renderData, 0, pencilLineBufferDefElemCount);
+								currentEntity = pushEntity(currentScene, std::move(pencil));
+
+								//if (connection) {
+								//	StringBuilder<> builder;
+								//	builder.appendBytes(Net_startEntity);
+								//	builder.appendBytes(pencil.color);
+								//	net::send(connection, (StringView)builder.get());
+								//}
+							} break;
+							case Tool_line: {
+								LineEntity line = {};
+								renderer->initLineEntity(line);
+								line.color = currentScene->drawColor;
+								line.initialThickness = line.line.b.thickness = getDrawThickness(currentScene);
+								Optional<Point> endpoint;
+								if (keyHeld(Key_control)) {
+									endpoint = getEndpoint(currentScene, line.id);
+								}
+								if (endpoint) {
+									line.position = endpoint->position;
+									line.line.a.thickness = endpoint->thickness;
+								} else {
+									line.position = smoothMouseScenePos;
+									line.line.a.thickness = line.initialThickness;
+								}
+								line.initialPosition = line.position;
+								line.line.a.position = {};
+								renderer->initDynamicLineArray(line.renderData, 0, 1);
+								currentEntity = pushEntity(currentScene, std::move(line));
+							} break;
+							case Tool_grid: {
+								GridEntity grid = {};
+								renderer->initGridEntity(grid);
+								grid.color = currentScene->drawColor;
+								grid.position = smoothMouseScenePos;
+								grid.thickness = getDrawThickness(currentScene);
+								grid.cellCount = displayGridSize = {4, 4};
+								updateWindowText = true;
+								renderer->initDynamicLineArray(grid.renderData, 0, grid.cellCount.x + grid.cellCount.y + 2);
+								currentEntity = pushEntity(currentScene, std::move(grid));
+							} break;
+							case Tool_circle: {
+								CircleEntity circle = {};
+								renderer->initCircleEntity(circle);
+								circle.color = currentScene->drawColor;
+								circle.position = circle.startPosition = smoothMouseScenePos;
+								circle.thickness = getDrawThickness(currentScene);
+								circle.radius = {};
+								renderer->initDynamicLineArray(circle.renderData, 0, CircleEntity::LINE_COUNT);
+								currentEntity = pushEntity(currentScene, std::move(circle));
+							} break;
+							case Tool_dropper: {
+							} break;
+							case Tool_hand: {
+							} break;
+							default: INVALID_CODE_PATH();
+						}
+					} 
+					if (mouseButtonHeld(0)) {
+						switch (currentScene->tool) {
+							case Tool_dropper: {
+								if (mousePosChanged || mouseButtonDown(0)) {
+									renderer->pickColor();
+								}
+							} break;
+							case Tool_hand: {
+							} break;
+							case Tool_pencil:
+							case Tool_line:
+							case Tool_grid:
+							case Tool_circle: {
+								if (currentEntity) {
+									switch (currentEntity->type) {
+										case Entity_pencil: {
+											auto &pencil = currentEntity->pencil;
+											if (smoothMousePosChanged || thicknessChanged || currentScene->drawColorDirty) {
+												if (pencil.popNextTime) {
+													pencil.lines.pop_back();
+													renderer->onLinePopped(pencil);
+												}
+												Line newLine = {};
+						
+												Optional<Point> endpoint;
+												if (pencil.lines.size()) {
+													Line lastLine = pencil.lines.back();
+													newLine.a.position = lastLine.b.position;
+													newLine.a.thickness = lastLine.b.thickness;
+													// newLine.a.color = lastLine.b.color;
+												} else {
+													if (keyHeld(Key_control)) {
+														endpoint = getEndpoint(currentScene, pencil.id);
+													}
+													if (endpoint) {
+														newLine.a = *endpoint;
+														newLine.a.position -= pencil.position;
+													} else {
+														newLine.a = pencil.newLineStartPoint;
+													}
+												}
+						
+												newLine.b.position = smoothMouseScenePos - pencil.position;
+
+												f32 endThickness = getDrawThickness(currentScene);
+												f32 sceneDist = distance(newLine.a.position, newLine.b.position) / endThickness;
+												f32 clientDist = distance(sceneToClientPos(newLine.a.position), sceneToClientPos(newLine.b.position));
+												if (!endpoint) {
+													// Pressure simulation on mouse
+													endThickness *= (1.0f / (max(0, sceneDist) * 0.5f + 1.0f));
+													if (!pencil.popNextTime) {
+														endThickness = lerp(endThickness, pencil.previousEndThickness, 0.666f);
+													}
+												}
+												pencil.previousEndThickness = endThickness;
+												pencil.popNextTime = clientDist < minPencilLineLength;
+
+												// Corner smoothing, looks bad
+		#if 0
+												u32 numSteps = 0;
+												if (pencil.lines.size()) {
+													numSteps = floorToInt(distance(smoothMouseScenePos, newLine.a.position) / currentScene->cameraDistance / currentScene->drawThickness);
+												}
+												if (numSteps > 1) {
+													Line lastLine = pencil.lines.back();
+													v2f lastDir = normalize(lastLine.b.position - lastLine.a.position);
+													v2f corner = lastLine.b.position + lastDir * dot(lastDir, newLine.b.position - newLine.a.position);
+													v2f toCorner = corner - lastLine.b.position;
+													v2f toEnd = smoothMouseScenePos - corner;
+
+													newLine.b = lastLine.b;
+													for (u32 i = 1; i <= numSteps; ++i) {
+														f32 t = (f32)i / numSteps;
+
+														newLine.a = newLine.b;
+														newLine.b.position = lastLine.b.position + toCorner*t + toEnd*t*t;
+														newLine.b.color.r = lerp(lastLine.b.color.r, currentScene->drawColor.r, t);
+														newLine.b.color.g = lerp(lastLine.b.color.g, currentScene->drawColor.g, t);
+														newLine.b.color.b = lerp(lastLine.b.color.b, currentScene->drawColor.b, t);
+														newLine.b.thickness = lerp(lastLine.b.thickness, endThickness, t);
+														pushLine(pencil, newLine);
+													}
+							
+													//renderer->release(pencil.lineBuffer);
+													//pencil.lineBuffer = d3d11State.createStructuredBuffer(pencil.transformedLines.size(), sizeof(TransformedLine), pencil.transformedLines.data(), D3D11_USAGE_IMMUTABLE);
+
+													u32 bufferElemCount = pencil.lineBuffer.size / sizeof(TransformedLine);
+													if (pencil.transformedLines.size() > bufferElemCount) {
+														renderer->release(pencil.lineBuffer);
+														pencil.lineBuffer = d3d11State.createStructuredBuffer(bufferElemCount + pencilLineBufferDefElemCount, sizeof(TransformedLine), pencil.transformedLines.data(), D3D11_USAGE_DEFAULT);
+													}
+													d3d11State.updateStructuredBuffer(pencil.lineBuffer, numSteps, sizeof(TransformedLine), pencil.transformedLines.end() - numSteps, pencil.transformedLines.size() - numSteps);
+
+													currentScene->needRepaint = true;
+												} else 
+		#endif
+												{
+													// newLine.b.color = currentScene->drawColor;
+													newLine.b.thickness = endThickness;
+
+													pushLine(pencil, newLine);
+
+													renderer->resizePencilLineArray(pencil);
+													renderer->updateLastElement(pencil);
+
+													currentScene->needRepaint = true;
+												}
+												//if (!pencil.popNextTime) {
+												//	if (connection) {
+												//		StringBuilder<> builder;
+												//		builder.appendBytes(Net_updateEntity);
+												//		builder.appendBytes(newLine);
+												//		net::send(connection, (StringView)builder.get());
+												//	}
+												//}
+											}
+										} break;
+										case Entity_line: {
+											auto &line = currentEntity->line;
+											bool updateLine = thicknessChanged || currentScene->drawColorDirty || smoothMousePosChanged;
+											Optional<Point> endpoint;
+											if (keyDown(Key_control)) {
+												endpoint = getEndpoint(currentScene, line.id);
 											}
 											if (endpoint) {
-												newLine.a.position = endpoint->position;
-												newLine.a.thickness = endpoint->thickness;
-												// newLine.a.color = endpoint->color;
-											} else {
-												newLine.a = pencil.newLineStartPoint;
+												line.line.a = *endpoint;
+												line.line.a.position -= line.position;
+												currentScene->needRepaint = true;
+												updateLine = true;
+											} 
+											if (keyUp(Key_control)) {
+												line.line.a.position = line.initialPosition;
+												line.line.a.thickness = line.initialThickness;
+												currentScene->needRepaint = true;
+												updateLine = true;
 											}
-										}
-						
-										newLine.b.position = smoothMouseWorldPos;
+											if (updateLine) {
+												line.line.b.position = smoothMouseScenePos - line.position;
+												line.line.b.thickness = getDrawThickness(currentScene);
+												// act.line.b.color = currentScene->drawColor;
 
-										f32 endThickness = getDrawThickness(currentScene);
-										f32 dist = distance(newLine.a.position, newLine.b.position) / endThickness;
-										if (!endpoint) {
-											// Pressure simulation on mouse
-											// endThickness *= (1.0f / (max(0, dist - minPencilLineLength) * 0.5f + 1.0f));
-										}
-										pencil.popNextTime = dist < minPencilLineLength;
-
-										// Corner smoothing, looks bad
-#if 0
-										u32 numSteps = 0;
-										if (pencil.lines.size()) {
-											numSteps = floorToInt(distance(smoothMouseWorldPos, newLine.a.position) / currentScene->cameraDistance / currentScene->drawThickness);
-										}
-										if (numSteps > 1) {
-											Line lastLine = pencil.lines.back();
-											v2f lastDir = normalize(lastLine.b.position - lastLine.a.position);
-											v2f corner = lastLine.b.position + lastDir * dot(lastDir, newLine.b.position - newLine.a.position);
-											v2f toCorner = corner - lastLine.b.position;
-											v2f toEnd = smoothMouseWorldPos - corner;
-
-											newLine.b = lastLine.b;
-											for (u32 i = 1; i <= numSteps; ++i) {
-												f32 t = (f32)i / numSteps;
-
-												newLine.a = newLine.b;
-												newLine.b.position = lastLine.b.position + toCorner*t + toEnd*t*t;
-												newLine.b.color.r = lerp(lastLine.b.color.r, currentScene->drawColor.r, t);
-												newLine.b.color.g = lerp(lastLine.b.color.g, currentScene->drawColor.g, t);
-												newLine.b.color.b = lerp(lastLine.b.color.b, currentScene->drawColor.b, t);
-												newLine.b.thickness = lerp(lastLine.b.thickness, endThickness, t);
-												pushLine(pencil, newLine);
+												renderer->updateLines(line.renderData, &line.line, 1, 0);
+												currentScene->needRepaint = true;
 											}
-							
-											//release(pencil.lineBuffer);
-											//pencil.lineBuffer = d3d11State.createStructuredBuffer(pencil.transformedLines.size(), sizeof(TransformedLine), pencil.transformedLines.data(), D3D11_USAGE_IMMUTABLE);
+										} break;
+										case Entity_grid: {
+											auto &grid = currentEntity->grid;
+											auto const squareKey = Key_shift;
+											if (thicknessChanged || gridCellCountChanged || keyChanged(squareKey) || mousePosChanged) {
+												v2f size = mouseScenePos - grid.position;
+												if (keyHeld(squareKey) && !keyHeld(Key_control)) {
+													grid.size = sign(size) * max(absolute(size.x), absolute(size.y));
+												} else {
+													grid.size = size;
+												}
+												grid.thickness = getDrawThickness(currentScene);
 
-											u32 bufferElemCount = pencil.lineBuffer.size / sizeof(TransformedLine);
-											if (pencil.transformedLines.size() > bufferElemCount) {
-												release(pencil.lineBuffer);
-												pencil.lineBuffer = d3d11State.createStructuredBuffer(bufferElemCount + pencilLineBufferDefElemCount, sizeof(TransformedLine), pencil.transformedLines.data(), D3D11_USAGE_DEFAULT);
+												renderer->updateGridLines(grid);
+
+												currentScene->needRepaint = true;
 											}
-											d3d11State.updateStructuredBuffer(pencil.lineBuffer, numSteps, sizeof(TransformedLine), pencil.transformedLines.end() - numSteps, pencil.transformedLines.size() - numSteps);
+										} break;
+										case Entity_circle: {
+											auto &circle = currentEntity->circle;
+											auto const ellipseKey = Key_shift;
+											if (thicknessChanged || mousePosChanged || keyChanged(ellipseKey)) {
+												if (keyHeld(ellipseKey)) {
+													circle.position = (circle.startPosition + mouseScenePos) * 0.5f;
+													circle.radius = absolute(circle.startPosition - mouseScenePos) * 0.5f;
+												} else {
+													circle.position = circle.startPosition;
+													circle.radius = V2f(length(mouseScenePos - circle.position));
+												}
+												circle.thickness = getDrawThickness(currentScene);
 
-											currentScene->needRepaint = true;
-										} else 
-#endif
-										{
-											// newLine.b.color = currentScene->drawColor;
-											if (pencil.popNextTime)
-												newLine.b.thickness = newLine.a.thickness;
-											else
-												newLine.b.thickness = endThickness;
-
-											pushLine(pencil, newLine);
-
-											u32 bufferElemCount = pencil.lineBuffer.size / sizeof(TransformedLine);
-											if (pencil.transformedLines.size() > bufferElemCount) {
-												release(pencil.lineBuffer);
-												pencil.lineBuffer = d3d11State.createStructuredBuffer(bufferElemCount + pencilLineBufferDefElemCount, sizeof(TransformedLine), pencil.transformedLines.data(), D3D11_USAGE_DEFAULT);
+												renderer->updateCircleLines(circle);
+												currentScene->needRepaint = true;
 											}
-											d3d11State.updateStructuredBuffer(pencil.lineBuffer, 1, sizeof(TransformedLine), pencil.transformedLines.end() - 1, pencil.transformedLines.size() - 1);
-
-											currentScene->needRepaint = true;
-										}
+										} break;
+										default: INVALID_CODE_PATH();
 									}
-								} break;
-								case ActionType_line: {
-									auto &act = currentAction.line;
-									bool updateLine = thicknessChanged || currentScene->drawColorDirty;
-									if (currentScene->postLastVisibleActionIndex) {
-										Point const *endpoint = 0;
-										if (keyDown(VK_CONTROL)) {
-											endpoint = getEndpoint(currentScene->actions[currentScene->postLastVisibleActionIndex - 1]);
-										}
-										if (endpoint) {
-											act.line.a.position = endpoint->position;
-											act.line.a.thickness = endpoint->thickness;
-											currentScene->needRepaint = true;
-											updateLine = true;
-										} 
-										if (keyUp(VK_CONTROL)) {
-											act.line.a.position = act.initialPosition;
-											act.line.a.thickness = act.initialThickness;
-											currentScene->needRepaint = true;
-											updateLine = true;
-										}
-									}
-									if (updateLine || smoothMouseWorldPosChanged) {
-										act.line.b.position = smoothMouseWorldPos;
-										act.line.b.thickness = getDrawThickness(currentScene);
-										// act.line.b.color = currentScene->drawColor;
-
-										TransformedLine transformedLine = transform(act.line);
-										d3d11State.updateStructuredBuffer(act.buffer, 1, sizeof(TransformedLine), &transformedLine);
+									if (drawBounds) {
+										calculateBounds(*currentEntity);
 										currentScene->needRepaint = true;
 									}
-								} break;
-								case ActionType_grid: {
-									auto &grid = currentAction.grid;
-									bool update = thicknessChanged || gridCellCountChanged || currentScene->drawColorDirty || keyChanged(VK_CONTROL);
-									if (update || smoothMouseWorldPosChanged) {
-										if (keyHeld(VK_CONTROL)) {
-											v2f dir = smoothMouseWorldPos - grid.startPoint.position;
-											grid.endPosition = grid.startPoint.position + sign(dir) * max(absolute(dir.x), absolute(dir.y));
-										} else {
-											grid.endPosition = smoothMouseWorldPos;
-										}
-										grid.startPoint.thickness = getDrawThickness(currentScene);
-										// grid.startPoint.color = currentScene->drawColor;
-
-										List<TransformedLine> lines;
-										lines.reserve(grid.cellCount * 2 + 2);
-										for (u32 i = 0; i <= grid.cellCount; ++i) {
-											Line line;
-											// line.a.color = line.b.color = grid.startPoint.color;
-											line.a.thickness = line.b.thickness = grid.startPoint.thickness;
-
-											line.a.position.y = grid.startPoint.position.y;
-											line.b.position.y = grid.endPosition.y;
-											line.a.position.x = line.b.position.x = lerp(grid.startPoint.position.x, grid.endPosition.x, (f32)i / grid.cellCount);
-											lines.push_back(transform(line));
-							
-											line.a.position.x = grid.startPoint.position.x;
-											line.b.position.x = grid.endPosition.x;
-											line.a.position.y = line.b.position.y = lerp(grid.startPoint.position.y, grid.endPosition.y, (f32)i / grid.cellCount);
-											lines.push_back(transform(line));
-										}
-										d3d11State.updateStructuredBuffer(grid.buffer, lines.size(), sizeof(TransformedLine), lines.data());
-
-										currentScene->needRepaint = true;
+								}
+							} break;
+							default: INVALID_CODE_PATH();
+						}
+					} 
+					if (mouseButtonUp(0)) {
+						if (currentEntity) {
+							calculateBounds(*currentEntity);
+							switch (currentEntity->type) {
+								case Entity_pencil: {
+									auto &pencil = currentEntity->pencil;
+									v2f offset = pencil.bounds.middle() - pencil.position;
+									pencil.position += offset;
+									for (auto &line : pencil.lines) {
+										line.a.position -= offset;
+										line.b.position -= offset;
 									}
+									renderer->updateLines(pencil.renderData, pencil.lines.data(), pencil.lines.size(), 0);
+									renderer->freeze(pencil);
+									//if (connection) {
+									//	StringBuilder<> builder;
+									//	builder.appendBytes(pencil.type);
+									//	builder.appendBytes(pencil.id);
+									//	builder.appendBytes(pencil.color);
+									//	builder.appendBytes((u32)pencil.lines.size());
+									//	for (auto l : pencil.lines) {
+									//		builder.appendBytes(l.a);
+									//		builder.appendBytes(l.b);
+									//	}
+									//	net::send(connection, (StringView)builder.get());
+									//}
 								} break;
+								case Entity_line: {
+									auto &line = currentEntity->line;
+									v2f offset = line.bounds.middle() - line.position;
+									line.position += offset;
+									line.line.a.position -= offset;
+									line.line.b.position -= offset;
+									renderer->updateLines(line.renderData, &line.line, 1, 0);
+								} break;
+								case Entity_grid: {
+									displayGridSize = {};
+									updateWindowText = true;
+								} break;
+								case Entity_circle: break;
+								default: INVALID_CODE_PATH();
 							}
-						} break;
-					}
-				} 
-				if (cursorUp()) {
-					if (currentAction.type != ActionType_none) {
-						switch (currentAction.type) {
-							case ActionType_pencil: {
-								auto &pencil = currentAction.pencil;
-								pencil.transformedLines = {};
-							} break;
-							case ActionType_line: {
-							} break;
-							case ActionType_grid: {
-								displayGridSize = 0;
-								updateWindowText = true;
-							} break;
-						}
-						if (currentScene->postLastVisibleActionIndex != currentScene->actions.size()) {
-							for (umm i = currentScene->postLastVisibleActionIndex; i < currentScene->actions.size(); ++i) {
-								cleanup(currentScene->actions[i]);
+							//if (connection) {
+							//	net::sendBytes(connection, Net_stopAction);
+							//}
+							currentEntity = 0;
+							if (drawBounds) {
+								currentScene->needRepaint = true;
 							}
-							currentScene->actions.resize(currentScene->postLastVisibleActionIndex);
 						}
-						currentScene->actions.push_back(std::move(currentAction));
-						currentScene->postLastVisibleActionIndex++;
-						currentAction.reset();
 					}
 				}
 			}
 		}
+		//if (currentAction.type != Action_none) {
+		//	currentScene->extraActionsToDraw.push_back(&currentAction);
+		//}
 
-		if (keyDown(VK_TAB)) {
-			canvasPieMenu.opened = false;
-			toolPieMenu.opened = false;
-			colorMenuOpened = false;
-			openPieMenu(mainPieMenu);
-		}
-		if (keyHeld(VK_TAB)) {
-			needRepaint = true;
-		}
+		//while (1) {
+		//	if (auto opt = receivedActions.try_pop()) {
+		//		auto action = *std::move(opt);
+		//		pushAction(currentScene, std::move(action));
+		//		currentScene->needRepaint = true;
+		//	} else {
+		//		break;
+		//	}
+		//}
+
 		auto updatePieMenu = [&](PieMenu &menu) {
-			menu.T = moveTowards(menu.T, (f32)menu.opened, 0.2f);
-			menu.TChanged = menu.T != menu.prevT;
-			menu.prevT = menu.T;
-			f32 oldAlpha = menu.alpha;
-			menu.alpha = moveTowards(menu.alpha, (f32)(distance((v2f)mousePosBL, menu.position) > min(windowSize.x, windowSize.y) * pieMenuSize * 0.5f), 0.1f);
-			if (menu.TChanged || menu.alpha != oldAlpha) {
+			menu.animTime = moveTowards(menu.animTime, (f32)menu.opened, 0.1f);
+			menu.animValue = easeInOut2(menu.animTime);
+			menu.TChanged = menu.animTime != menu.prevT;
+			menu.prevT = menu.animTime;
+			if (menu.TChanged) {
 				needRepaint = true;
 			}
 			if (menu.opened) {
-				if (keyDown(VK_ESCAPE)) {
-					menu.opened = false;
+				cursorVisible = true;
+				f32 oldAlpha = menu.handAlphaTime;
+				menu.handAlphaTime = moveTowards(menu.handAlphaTime, (f32)(distance((v2f)mousePosBL, menu.position) > pieMenuSize * 0.5f), 0.1f);
+				menu.handAlphaValue = easeInOut2(menu.handAlphaTime);
+				if (menu.handAlphaTime != oldAlpha) {
+					needRepaint = true;
 				}
-				if (cursorDown() || keyUp(VK_TAB)) {
-					//ignoreCursorFrameCount = 1;
+				menu.angle = atan2((v2f)mousePosBL - menu.position);
+				if (keyDown(Key_escape)) {
+					closePieMenu(menu);
+				}
+				if (mouseButtonDown(mouseButton_left) || (keyUp(Key_tab))) {
+					if (mouseButtonDown(mouseButton_left)) {
+						closePieMenu(menu);
+					}
+					if (distance((v2f)mousePosBL, menu.position) > pieMenuSize * 0.5f) {
+						closePieMenu(menu);
 
-					menu.opened = false;
-					if (distance((v2f)mousePosBL, menu.position) > min(windowSize.x, windowSize.y) * pieMenuSize * 0.5f) {
 						f32 a = frac(map(atan2((v2f)mousePosBL - menu.position), -pi, pi, 0, 1) + 0.5f / menu.items.size()) * menu.items.size();
 						
-						mousePos = (v2s)menu.position;
-						mousePos.y = windowSize.y - mousePos.y;
+						mousePosTL = (v2s)menu.position;
+						mousePosTL.y = clientSize.y - mousePosTL.y;
 
-						setCursorPos(mousePos + windowPos);
+						setCursorPos(mousePosTL + windowPos);
 
-						mousePosBL = mousePos;
-						mousePosBL.y = windowSize.y - mousePos.y;
+						mousePosBL = mousePosTL;
+						mousePosBL.y = clientSize.y - mousePosTL.y;
+
+						smoothMousePosChanged = true;
+						smoothMousePos = (v2f)mousePosBL;
 
 						for (u32 i = 0; i < menu.items.size(); ++i) {
 							if (a <= i + 1) {
@@ -2533,20 +2716,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int) {
 			}
 		};
 
-		static f32 prevColorMenuAlpha = colorMenuAlpha;
-		colorMenuAlpha = moveTowards(colorMenuAlpha, (f32)colorMenuOpened, 0.125f);
+		prevColorMenuAnimTime = colorMenuAnimTime;
+		colorMenuAnimTime = moveTowards(colorMenuAnimTime, (f32)colorMenuOpened, 0.1f);
 
-		if (colorMenuAlpha != prevColorMenuAlpha) {
+		if (colorMenuAnimTime != prevColorMenuAnimTime) {
+			colorMenuAnimValue = easeInOut2(colorMenuAnimTime);
 			needRepaint = true;
 		}
 
-		updatePieMenu(toolPieMenu);
-		updatePieMenu(canvasPieMenu);
 		updatePieMenu(mainPieMenu);
 		
-		if (smoothMouseWorldPosChanged) {
-			currentScene->constantBufferData.mouseWorldPos = smoothMouseWorldPos;
-			currentScene->constantBufferDirty = true;
+		if (smoothMousePosChanged || currentScene->drawColorDirty || thicknessChanged) {
+			needRepaint = true;
+			renderer->updatePaintCursor(currentScene, smoothMousePos, currentScene->drawColor, currentScene->windowDrawThickness);
 		}
 
 		if (windowResized) {
@@ -2557,33 +2739,63 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR args, int) {
 			currentScene->matrixSceneToNDCDirty = true;
 		}
 
-		if (mousePosChanged && mouseHovering) {
+		if ((mousePosChanged && mouseHovering) || (!mouseHovering && previousMouseHovering)) {
 			needRepaint = true;
 		}
-		if (mouseExited) {
-			currentScene->needRepaint = true;
+
+		if (cursorVisible) {
+			showCursor();
+		} else {
+			hideCursor();
 		}
 
-		repaint(mouseHovering && !hoveringColorMenu);
+		bool drawCursor = mouseHovering && !hoveringColorMenu && !cursorVisible;
+		renderer->repaint(drawCursor, drawCursor && currentScene->tool != Tool_hand);
+		for (auto &sc : scenes) {
+			if (sc.initialized) {
+				sc.extraActionsToDraw.clear();
+			}
+		}
 		
 		if (updateWindowText) {
 			updateWindowText = false;
-			wchar buf[1024];
+			u32 sceneIndex = (u32)(currentScene - scenes);
+			auto loc = localizations + language;
+			StringBuilder<wchar> builder;
+			builder.appendFormat(loc->windowTitlePrefix, sceneIndex);
 			if (currentScene->path.size()) {
-				if (displayGridSize) {
-					swprintf_s(buf, countof(buf), localizations[language].windowTitle_path_gridSize, currentScene->filename, (u32)(currentScene - scenes), displayGridSize);
+				if (displayGridSize.x) {
+					builder.appendFormat(localizations[language].windowTitle_path_gridSize, currentScene->filename, currentScene->showAsterisk ? '*' : '\n', displayGridSize.x, displayGridSize.y);
 				} else {
-					swprintf_s(buf, countof(buf), localizations[language].windowTitle_path, currentScene->filename, (u32)(currentScene - scenes));
+					builder.appendFormat(localizations[language].windowTitle_path, currentScene->filename, currentScene->showAsterisk ? '*' : '\n');
 				}
 			} else {
-				if (displayGridSize) {
-					swprintf_s(buf, countof(buf), localizations[language].windowTitle_gridSize, (u32)(currentScene - scenes), displayGridSize);
+				if (displayGridSize.x) {
+					builder.appendFormat(localizations[language].windowTitle_untitled_gridSize, displayGridSize.x, displayGridSize.y);
 				} else {
-					swprintf_s(buf, countof(buf), localizations[language].windowTitle, (u32)(currentScene - scenes));
+					builder.appendFormat(localizations[language].windowTitle_untitled);
 				}
 			}
-			SetWindowTextW(mainWindow, buf);
+			setWindowTitle(builder.getNullTerminated().data());
 		}
+		previousMouseHovering = mouseHovering;
 	}
+
+	for (auto &scene : scenes) {
+		if (!scene.initialized)
+			continue;
+		for (auto &[id, e] : scene.entities) {
+			cleanup(e);
+		}
+		renderer->releaseScene(&scene);
+	}
+
 	deinitThreadPool(&threadPool);
+	imageLoaderThread.join();
+
+	renderer->shutdown();
+
+#if TRACK_ALLOCATIONS
+	logUnfreedMemory();
+#endif
 }
